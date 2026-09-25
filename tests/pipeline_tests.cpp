@@ -282,7 +282,7 @@ int main(int argc, char** argv) {
             auto inputs = renderer.latewarp_inputs(src, true);
             inputs.depth_inverted = true;
             if (alpha != 0.0f) {
-                ID3D12Resource* result = renderer.extrapolate_objects(src, false, alpha);
+                ID3D12Resource* result = renderer.extrapolate_objects(src, false, alpha, still.clip_to_prev_clip);
                 EXPECT(result != nullptr, "extrapolation ran");
                 if (result) inputs.backbuffer = inputs.hudless = result;
             }
@@ -298,6 +298,23 @@ int main(int argc, char** argv) {
         const double moved_x = peak(px, w, h, true, 1), moved_red = peak(px, w, h, false, 0);
         evaluate(renderer.begin_frame(), 0.5f, false);
         const double half_x = peak(px, w, h, true, 1);
+        // Interpolation (what the presenter uses): half a frame back towards the previous position. The
+        // part of the bar's current area it has left must show background, not a stretched bar.
+        evaluate(renderer.begin_frame(), -0.5f, false);
+        const double back_x = peak(px, w, h, true, 1);
+        auto white_at = [&](double x) {
+            double sum = 0; const std::uint32_t xi = std::uint32_t(x);
+            for (std::uint32_t y = h * 2 / 5; y < h * 3 / 5; ++y) {
+                const std::size_t i = (std::size_t(y) * w + xi) * 4;
+                sum += (half_to_float(px[i]) + half_to_float(px[i + 1]) + half_to_float(px[i + 2])) / 3.0;
+            }
+            return sum / double(h / 5);
+        };
+        const double left_behind = white_at(still_x + 4.0 * double(W) / double(DW));  // inside the old bar, outside the moved one
+        std::printf("interpolated -1/2 frame: bar x=%.0f (expected %.1f), brightness where it left %.2f\n", back_x,
+                    still_x - 10.0 * double(W) / double(DW), left_behind);
+        EXPECT(std::fabs((back_x - still_x) + 10.0 * double(W) / double(DW)) < 4.0, "interpolating back moves the object towards its previous position");
+        EXPECT(left_behind < 0.5, "the area the object left shows background (%.2f)", left_behind);
         const double expected_move = 20.0 * double(W) / double(DW);
         std::printf("object extrapolation: bar x=%.0f, +1 frame x=%.0f (expected +%.1f), +1/2 frame x=%.0f; red bar y %.0f -> %.0f; moving pixels %.0f of %.0f\n",
                     still_x, moved_x, expected_move, half_x, still_red, moved_red, fit.moving, fit.samples);
@@ -312,7 +329,7 @@ int main(int argc, char** argv) {
                 auto* lf = renderer.begin_frame();
                 auto inputs = renderer.latewarp_inputs(src, true);
                 inputs.depth_inverted = true;
-                if (alpha != 0.0f) if (ID3D12Resource* r = renderer.extrapolate_objects(src, false, alpha)) inputs.backbuffer = inputs.hudless = r;
+                if (alpha != 0.0f) if (ID3D12Resource* r = renderer.extrapolate_objects(src, false, alpha, still.clip_to_prev_clip)) inputs.backbuffer = inputs.hudless = r;
                 latewarp.evaluate(lf, inputs, false, view_matrix(source, {}), view_matrix(source, {}), projection);
                 renderer.finish_frame(true, 0);
                 renderer.wait_idle();

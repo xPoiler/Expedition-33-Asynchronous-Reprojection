@@ -109,28 +109,47 @@ struct VramMonitor {
     }
 };
 
-// Scale that maps the game's motion vectors to uv (per axis), fitted against the camera-only motion of
-// every pixel. Frames where the camera barely moves carry no information and are skipped.
+// Scale that maps the game's motion vectors to uv (per axis), measured against the camera-only motion of
+// every pixel. Only frames that fit almost perfectly count (cuts, camera animations and large moving
+// areas do not), and the scale locks once several agree. Motion vectors in render pixels (Unreal) are
+// recognised and then follow the render resolution, so DLSS preset changes need no relearning.
 struct MotionVectorScale {
-    double gc[2] = {}, gg[2] = {}, cc[2] = {};
-    double scale[2] = {}, quality = 0, moving_fraction = 0;
-    bool valid = false;
-    void add(const MotionFit& f) {
-        if (f.samples < 1000) return;
+    double quality = 0, moving_fraction = 0;
+    bool valid = false, pixel_units = false;
+    double locked[2] = {};     // uv per unit (generic) or +-1 per render pixel (pixel units)
+    double candidate[2] = {};
+    bool candidate_pixels = false;
+    int agree = 0;
+    // Returns true when the locked value changed.
+    bool add(const MotionFit& f, double render_w, double render_h) {
+        if (f.samples < 1000) return false;
         moving_fraction = f.moving / f.samples;
-        const double motion = (f.cc[0] + f.cc[1]) / f.samples;  // mean squared camera motion, uv^2
-        if (motion < 1e-8) return;
-        for (int k = 0; k < 2; ++k) { gc[k] = gc[k] * 0.8 + f.gc[k]; gg[k] = gg[k] * 0.8 + f.gg[k]; cc[k] = cc[k] * 0.8 + f.cc[k]; }
-        double q = 1;
+        if ((f.cc[0] + f.cc[1]) / f.samples < 1e-8) return false;  // camera nearly still: no information
+        double scale[2], q = 1;
         for (int k = 0; k < 2; ++k) {
-            if (gg[k] <= 0 || cc[k] <= 0) return;
-            scale[k] = gc[k] / gg[k];
-            const double residual = scale[k] * scale[k] * gg[k] - 2 * scale[k] * gc[k] + cc[k];
-            q = std::min(q, 1.0 - residual / cc[k]);
+            if (f.gg[k] <= 0 || f.cc[k] <= 0) return false;
+            scale[k] = f.gc[k] / f.gg[k];
+            const double residual = scale[k] * scale[k] * f.gg[k] - 2 * scale[k] * f.gc[k] + f.cc[k];
+            q = std::min(q, 1.0 - residual / f.cc[k]);
         }
         quality = q;
-        valid = quality > 0.5;
+        if (q < 0.97) return false;
+        const double px = scale[0] * render_w, py = scale[1] * render_h;
+        const bool pixels = std::fabs(std::fabs(px) - 1) < 0.03 && std::fabs(std::fabs(py) - 1) < 0.03;
+        double value[2] = {pixels ? (px > 0 ? 1.0 : -1.0) : scale[0], pixels ? (py > 0 ? 1.0 : -1.0) : scale[1]};
+        const bool same = candidate[0] != 0 && pixels == candidate_pixels &&
+                          std::fabs(value[0] / candidate[0] - 1) < 0.05 && std::fabs(value[1] / candidate[1] - 1) < 0.05;
+        agree = same ? agree + 1 : 1;
+        if (!same) { candidate[0] = value[0]; candidate[1] = value[1]; candidate_pixels = pixels; }
+        const bool differs = !valid || pixels != pixel_units || std::fabs(value[0] / locked[0] - 1) > 0.05 ||
+                             std::fabs(value[1] / locked[1] - 1) > 0.05;
+        if (differs && agree >= (valid ? 10 : 3)) {
+            locked[0] = candidate[0]; locked[1] = candidate[1]; pixel_units = candidate_pixels; valid = true;
+            return true;
+        }
+        return false;
     }
+    double scale(int axis, double render_size) const { return pixel_units ? locked[axis] / render_size : locked[axis]; }
 };
 
 CameraBasis to_basis(const Camera& c) {
@@ -252,7 +271,6 @@ void render_thread() {
     bool pacing_paused = false;
     bool device_loss_logged = false;
     MotionVectorScale mv_scale;
-    bool mv_scale_logged = false;
     double last_mv_log = 0;
 
     while (g_app.running) {
@@ -354,6 +372,7 @@ void render_thread() {
         auto* list = renderer.begin_frame();
         if (newest >= 0 && InterlockedCompareExchange(&sh.slots[newest].state, kReading, kReady) == kReady) {
             const SlotMeta& m = sh.slots[newest];
+            renderer.set_keep_previous_colour(settings.extrapolate_objects != 0);
             IngestedSource s = renderer.ingest(sh, newest);
             held.push_back({newest, renderer.submitted_value() + 1});
             if (s.valid) {
@@ -378,7 +397,8 @@ void render_thread() {
                     std::fputc('\n', g_app.csv_sources);
                 }
                 if (settings.extrapolate_objects && s.has_motion)
-                    renderer.analyze_motion(s, m.camera.clip_to_prev_clip, float(mv_scale.scale[0]), float(mv_scale.scale[1]), mv_scale.valid);
+                    renderer.analyze_motion(s, m.camera.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
+                                            float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid);
                 first_eval = true;
                 const double present_t = seconds(m.qpc_present);
                 if (last_source_present > 0) source_interval = present_t - last_source_present;
@@ -401,9 +421,11 @@ void render_thread() {
             inputs.depth_inverted = source_camera.depth_inverted != 0;
             if (settings.extrapolate_objects && source.has_motion && mv_scale.valid) {
                 const double interval = g_app.model.frame_interval();
-                const float alpha = interval > 0 ? float(std::clamp(p.horizon / interval, -1.5, 1.5)) : 0.0f;
+                // Interpolation only: between the object's exact previous and current positions (from the
+                // motion vectors). When the camera is shown ahead of the newest frame, objects hold there.
+                const float alpha = interval > 0 ? float(std::clamp(p.horizon / interval, -1.0, 0.0)) : 0.0f;
                 const bool split = inputs.hudless != inputs.backbuffer;
-                if (ID3D12Resource* moved = renderer.extrapolate_objects(source, split, alpha)) {
+                if (ID3D12Resource* moved = alpha < 0 ? renderer.extrapolate_objects(source, split, alpha, source_camera.clip_to_prev_clip) : nullptr) {
                     inputs.hudless = moved;
                     if (!split) inputs.backbuffer = moved;
                 }
@@ -444,7 +466,11 @@ void render_thread() {
             const auto notes = renderer.take_notes();
             for (const auto& note : notes) logf("%s", note.c_str());
             MotionFit fit;
-            if (renderer.take_motion_fit(fit)) mv_scale.add(fit);
+            if (renderer.take_motion_fit(fit) && mv_scale.add(fit, source.depth_rect.w, source.depth_rect.h))
+                logf("motion vectors locked: %s, scale %.4g x %.4g (sign %+.0f %+.0f), fit quality %.3f",
+                     mv_scale.pixel_units ? "render pixels" : "custom units", mv_scale.scale(0, source.depth_rect.w),
+                     mv_scale.scale(1, source.depth_rect.h), mv_scale.locked[0] < 0 ? -1.0 : 1.0, mv_scale.locked[1] < 0 ? -1.0 : 1.0,
+                     mv_scale.quality);
             vram.poll(now, notes.empty() ? nullptr : "texture change");
         }
         if (now - stat_start >= 0.5) {
@@ -474,14 +500,14 @@ void render_thread() {
             st.orbit_cm = float(g_app.model.learned_orbit());
             st.frame_interval_ms = float(g_app.model.frame_interval() * 1000.0);
             st.effective_prediction_ms = float(g_app.model.effective_prediction() * 1000.0);
-            st.mv_scale_x = mv_scale.valid ? float(mv_scale.scale[0]) : 0.0f;
-            st.mv_scale_y = mv_scale.valid ? float(mv_scale.scale[1]) : 0.0f;
+            st.mv_scale_x = mv_scale.valid ? float(mv_scale.scale(0, source.depth_rect.w)) : 0.0f;
+            st.mv_scale_y = mv_scale.valid ? float(mv_scale.scale(1, source.depth_rect.h)) : 0.0f;
             st.mv_fit_quality = float(mv_scale.quality);
             st.moving_fraction = float(mv_scale.moving_fraction);
-            if (mv_scale.valid && (!mv_scale_logged || now - last_mv_log > 10.0)) {
-                logf("motion vectors: scale %.4g x %.4g (to uv), fit quality %.3f, moving pixels %.1f%%", mv_scale.scale[0], mv_scale.scale[1],
-                     mv_scale.quality, mv_scale.moving_fraction * 100.0);
-                mv_scale_logged = true; last_mv_log = now;
+            if (settings.extrapolate_objects && mv_scale.valid && now - last_mv_log > 10.0) {
+                logf("objects: motion vectors %s, last fit quality %.3f, moving pixels %.1f%%",
+                     mv_scale.pixel_units ? "in render pixels" : "in custom units", mv_scale.quality, mv_scale.moving_fraction * 100.0);
+                last_mv_log = now;
             }
             {
                 LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);

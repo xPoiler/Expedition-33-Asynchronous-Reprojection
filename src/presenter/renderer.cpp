@@ -74,7 +74,9 @@ groupshared float4 gs_a[64], gs_b[64];
             const float2 g = motion_t.Load(int3(min(id.xy, mv_size - 1), 0));
             if (prev.w > 0 && all(abs(g) < 1e4)) {
                 const float2 own = (g * mv_scale - cam) * float2(rect.zw);
-                const bool moving = (flags & 1) && dot(own, own) > threshold * threshold;
+                const float2 cam_px = cam * float2(rect.zw);
+                const float limit = max(threshold, 0.15 * length(cam_px));  // camera-model error grows with camera speed
+                const bool moving = (flags & 1) && dot(own, own) > limit * limit;
                 o = float4(own, d, moving ? 1 : 0);
                 a = float4(g.x * cam.x, g.x * g.x, cam.x * cam.x, 1);
                 b = float4(g.y * cam.y, g.y * g.y, cam.y * cam.y, moving ? 1 : 0);
@@ -123,40 +125,56 @@ Texture2D<float4> object_t : register(t0);
     InterlockedMax(dest_u[dst], key);
 }
 
-// Gather at output resolution: moved object pixels, else the static image; where an object moved
-// away, pull background from behind it (along its motion), else keep the original pixel.
+// Gather at output resolution. alpha <= 0 interpolates objects towards their previous position (exact
+// path from the motion vectors). Pixels an object covers now but has left at this time show the
+// previous game frame's background (reprojected by the camera motion); otherwise stretch from behind.
 Texture2D<uint> dest_t : register(t0);
 Texture2D<float4> object_g : register(t1);
 Texture2D<float4> colour_t : register(t2);
 Texture2D<float> depth_g : register(t3);
+Texture2D<float4> previous_t : register(t4);
 RWTexture2D<float4> out_u : register(u0);
+float4 bilinear(Texture2D<float4> t, float2 pos) {  // pos in texel centres (0.5 = first texel)
+    const float2 p = clamp(pos - 0.5, 0, float2(out_size) - 1.001);
+    const int2 i = int2(floor(p));
+    const float2 f = p - float2(i);
+    const float4 a = t.Load(int3(i, 0)), b = t.Load(int3(i + int2(1, 0), 0));
+    const float4 c = t.Load(int3(i + int2(0, 1), 0)), d = t.Load(int3(i + int2(1, 1), 0));
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
 [numthreads(8, 8, 1)] void cs_gather(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= out_size)) return;
     const float2 scale = float2(out_size) / float2(rect.zw);
-    const int2 pr = int2(rect.xy) + int2(min(uint2((float2(id.xy) + 0.5) / scale), rect.zw - 1));
+    const float2 centre = float2(id.xy) + 0.5;
+    const int2 pr = int2(rect.xy) + int2(min(uint2(centre / scale), rect.zw - 1));
     const uint key = dest_t.Load(int3(pr, 0));
     const float4 here = object_g.Load(int3(pr, 0));
     if (key != 0) {
         const int2 off = int2((key >> 11) & 2047, key & 2047) - 1024;
         const bool occluded = here.w < 0.5 && depth_key(depth_g.Load(int3(pr, 0))) > float(key >> 22) + 2.0;
         if (!occluded) {
-            const int2 src = clamp(int2(id.xy) - int2(round(float2(off) * scale)), int2(0, 0), int2(out_size) - 1);
-            out_u[id.xy] = colour_t.Load(int3(src, 0));
+            const float4 o = object_g.Load(int3(pr - off, 0));
+            const float2 move = -o.xy * alpha;  // exact, in render px
+            out_u[id.xy] = bilinear(colour_t, centre - move * scale);
             return;
         }
     }
     if (here.w > 0.5 && alpha != 0) {
-        const float2 behind = here.xy * alpha;  // opposite to where the object went
+        if (flags & 2) {
+            const float2 uv = (float2(pr - int2(rect.xy)) + 0.5) / float2(rect.zw);
+            const float4 pv = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, depth_g.Load(int3(pr, 0)), 1), clip_to_prev);
+            if (pv.w > 0) {
+                const float2 puv = float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5);
+                if (all(puv >= 0) && all(puv <= 1)) { out_u[id.xy] = bilinear(previous_t, puv * float2(out_size)); return; }
+            }
+        }
+        const float2 behind = here.xy * alpha;
         const float len = length(behind);
         const float2 dir = behind / max(len, 1e-6);
         const float step = max(1.0, len / 4.0);
         [loop] for (int k = 1; k <= 8; ++k) {
             const int2 q = clamp(pr + int2(round(dir * step * k)), int2(rect.xy), int2(rect.xy + rect.zw) - 1);
-            if (object_g.Load(int3(q, 0)).w < 0.5) {
-                const int2 src = clamp(int2(id.xy) + int2(round(dir * step * k * scale)), int2(0, 0), int2(out_size) - 1);
-                out_u[id.xy] = colour_t.Load(int3(src, 0));
-                return;
-            }
+            if (object_g.Load(int3(q, 0)).w < 0.5) { out_u[id.xy] = bilinear(colour_t, centre + dir * step * k * scale); return; }
         }
     }
     out_u[id.xy] = colour_t.Load(int3(id.xy, 0));
@@ -167,9 +185,10 @@ RWTexture2D<float4> out_u : register(u0);
 constexpr UINT kSrcSrv = 0;         // + slot * kTexCount + kind: shared textures
 constexpr UINT kPrivUav = 32;       // + private id
 constexpr UINT kPrivSrv = 48;       // + private id
-// Extrapolation tables (4 SRVs t0-t3, 2 UAVs u0-u1 each).
-constexpr UINT kXAnalyzeSrv = 64, kXAnalyzeUav = 68, kXReduceUav = 70, kXSplatSrv = 72, kXSplatUav = 76;
-constexpr UINT kXGatherSrvHudless = 78, kXGatherSrvBackbuffer = 82, kXGatherUav = 86;
+// Extrapolation tables (6 SRVs t0-t5, 2 UAVs u0-u1 each).
+constexpr UINT kXSrvCount = 6;
+constexpr UINT kXAnalyzeSrv = 64, kXAnalyzeUav = 70, kXReduceUav = 72, kXSplatSrv = 74, kXSplatUav = 80;
+constexpr UINT kXGatherSrvHudless = 82, kXGatherSrvBackbuffer = 88, kXGatherUav = 94;
 constexpr UINT kHeapSize = 96;
 
 DXGI_FORMAT srv_format(DXGI_FORMAT f) {
@@ -350,7 +369,7 @@ bool Renderer::create_pipelines(std::string& error) {
     if (FAILED(device_->CreateGraphicsPipelineState(&gd, IID_PPV_ARGS(&blit_)))) { error = "blit pso"; return false; }
 
     // Extrapolation passes: 32 constants, 4 SRVs, 2 UAVs.
-    D3D12_DESCRIPTOR_RANGE xsrv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0};
+    D3D12_DESCRIPTOR_RANGE xsrv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kXSrvCount, 0, 0, 0};
     D3D12_DESCRIPTOR_RANGE xuav{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0};
     D3D12_ROOT_PARAMETER xp[3]{};
     xp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; xp[0].Constants = {0, 0, 32};
@@ -443,8 +462,7 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
     // Descriptors are rewritten each time; the resources behind them only change after wait_idle.
     set_x_srv(kXAnalyzeSrv + 0, kPDepth);
     set_x_srv(kXAnalyzeSrv + 1, kPMotion);
-    set_x_srv(kXAnalyzeSrv + 2, kPDepth);
-    set_x_srv(kXAnalyzeSrv + 3, kPDepth);
+    for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXAnalyzeSrv + i, kPDepth);
     set_x_uav(kXAnalyzeUav + 0, kPObject);
     auto buffer_uav = [&](UINT index, ID3D12Resource* r, UINT elements) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
@@ -463,7 +481,7 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
     c.grid[0] = w; c.grid[1] = h;
     c.mv_size[0] = private_[kPMotion].width; c.mv_size[1] = private_[kPMotion].height;
     c.mv_scale[0] = scale_x; c.mv_scale[1] = scale_y;
-    c.threshold = 0.75f;
+    c.threshold = 1.0f;
     c.groups_x = gx;
     c.flags = scale_valid ? 1u : 0u;
     transition(private_[kPObject], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -481,13 +499,13 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
     fit_pending_[frame_index_] = true;
 }
 
-ID3D12Resource* Renderer::extrapolate_objects(const IngestedSource& src, bool from_hudless, float alpha) {
+ID3D12Resource* Renderer::extrapolate_objects(const IngestedSource& src, bool from_hudless, float alpha, const float clip_to_prev_clip[16]) {
     if (!src.has_depth || !src.has_motion || !private_[kPObject].texture) return nullptr;
     const UINT w = private_[kPObject].width, h = private_[kPObject].height;
     const PrivateId colour = from_hudless ? kPHudless : kPBackbuffer;
     const UINT ow = private_[colour].width, oh = private_[colour].height;
     if (!ensure_private(kPDest, w, h, DXGI_FORMAT_R32_UINT) || !ensure_private(kPExtrap, ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT)) return nullptr;
-    for (UINT i = 0; i < 4; ++i) set_x_srv(kXSplatSrv + i, kPObject);
+    for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXSplatSrv + i, kPObject);
     set_x_uav(kXSplatUav + 0, kPDest);
     set_x_uav(kXSplatUav + 1, kPDest);
     const UINT gather = from_hudless ? kXGatherSrvHudless : kXGatherSrvBackbuffer;
@@ -495,6 +513,10 @@ ID3D12Resource* Renderer::extrapolate_objects(const IngestedSource& src, bool fr
     set_x_srv(gather + 1, kPObject);
     set_x_srv(gather + 2, colour);
     set_x_srv(gather + 3, kPDepth);
+    const bool previous = previous_valid_ && previous_from_hudless_ == from_hudless && private_[kPPrevious].texture &&
+                          private_[kPPrevious].width == ow && private_[kPPrevious].height == oh;
+    set_x_srv(gather + 4, previous ? kPPrevious : colour);
+    set_x_srv(gather + 5, colour);
     set_x_uav(kXGatherUav + 0, kPExtrap);
     set_x_uav(kXGatherUav + 1, kPExtrap);
 
@@ -504,6 +526,8 @@ ID3D12Resource* Renderer::extrapolate_objects(const IngestedSource& src, bool fr
     c.grid[0] = w; c.grid[1] = h;
     c.out_size[0] = ow; c.out_size[1] = oh;
     c.alpha = alpha;
+    std::memcpy(c.clip_to_prev, clip_to_prev_clip, sizeof(c.clip_to_prev));
+    c.flags = previous ? 2u : 0u;
     transition(private_[kPDest], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     x_dispatch(cs_clear_.Get(), &c, kXSplatSrv, kXSplatUav, (w + 7) / 8, (h + 7) / 8);
     D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = private_[kPDest].texture.Get();
@@ -689,6 +713,18 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot) {
     ensure_private(kPUi, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ensure_private(kPZeroUi, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ensure_private(kPOutput, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    if (keep_previous_ && ingested_) {
+        const PrivateId from = last_had_hudless_ ? kPHudless : kPBackbuffer;
+        if (private_[from].texture && ensure_private(kPPrevious, private_[from].width, private_[from].height, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+            transition(private_[from], D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(private_[kPPrevious], D3D12_RESOURCE_STATE_COPY_DEST);
+            list_->CopyResource(private_[kPPrevious].texture.Get(), private_[from].texture.Get());
+            transition(private_[from], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            transition(private_[kPPrevious], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            previous_valid_ = true;
+            previous_from_hudless_ = last_had_hudless_;
+        }
+    }
     convert(sources[kBackbuffer], static_cast<DXGI_FORMAT>(bb.format), slot, kBackbuffer, kPBackbuffer, bb.width, bb.height);
 
     const auto& hl = m.tex[kHudless];
@@ -715,6 +751,8 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot) {
         out.depth_rect = {dp.ext_x, dp.ext_y, dp.ext_w, dp.ext_h};
         out.has_depth = true;
     }
+    ingested_ = true;
+    last_had_hudless_ = out.has_hudless;
     barriers.clear();
     for (auto* r : reading_) barriers.push_back(transition_barrier(r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
     list_->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());

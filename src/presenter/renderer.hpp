@@ -79,7 +79,9 @@ public:
     void analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid);
     // Per output frame: moves object pixels `alpha` game frames forward (negative: back) into a copy of
     // the hud-less colour (or the backbuffer). Returns the result, or nullptr when unavailable.
-    ID3D12Resource* extrapolate_objects(const IngestedSource& src, bool from_hudless, float alpha);
+    ID3D12Resource* extrapolate_objects(const IngestedSource& src, bool from_hudless, float alpha, const float clip_to_prev_clip[16]);
+    // Keep a copy of the previous game frame's colour at each ingest (background for uncovered areas).
+    void set_keep_previous_colour(bool on) { keep_previous_ = on; if (!on) previous_valid_ = false; }
     bool take_motion_fit(MotionFit& fit);
 
     // Test/diagnostic helper: synchronously reads back the warped output (RGBA16F) or private backbuffer.
@@ -92,7 +94,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPCount };
 
     bool create_pipelines(std::string& error);
     bool ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format);
@@ -129,6 +131,7 @@ private:
     UINT partial_groups_ = 0;
     bool fit_pending_[3] = {};
     bool fit_ready_ = false;
+    bool keep_previous_ = false, previous_valid_ = false, previous_from_hudless_ = false, ingested_ = false, last_had_hudless_ = false;
     MotionFit fit_latest_;
     ComPtr<ID3D12PipelineState> cs_color_, cs_depth_, blit_;
     ComPtr<ID3D12DescriptorHeap> heap_, rtv_heap_;
