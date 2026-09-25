@@ -43,13 +43,19 @@ struct CameraBasis {
 
 using Mat4 = std::array<float, 16>;
 
-// Row-vector world-to-view matrix (view x=right, y=up, z=forward), positions relative to origin.
-inline Mat4 view_matrix(const CameraBasis& c, Vec3 origin) {
+// Sign of view-space z for points in front of the camera, from a row-vector projection's w column:
+// +1 when clip.w = +z (Unreal: view z = forward), -1 when clip.w = -z (right-handed engines such as
+// RE Engine: the camera looks down -z).
+inline double view_z_sign(const float* view_to_clip) { return view_to_clip[11] < 0.0f ? -1.0 : 1.0; }
+
+// Row-vector world-to-view matrix (view x=right, y=up, z=forward*z_sign), positions relative to origin.
+inline Mat4 view_matrix(const CameraBasis& c, Vec3 origin, double z_sign = 1.0) {
     const Vec3 p = c.pos - origin;
-    return {static_cast<float>(c.right.x), static_cast<float>(c.up.x), static_cast<float>(c.fwd.x), 0.0f,
-            static_cast<float>(c.right.y), static_cast<float>(c.up.y), static_cast<float>(c.fwd.y), 0.0f,
-            static_cast<float>(c.right.z), static_cast<float>(c.up.z), static_cast<float>(c.fwd.z), 0.0f,
-            static_cast<float>(-dot(p, c.right)), static_cast<float>(-dot(p, c.up)), static_cast<float>(-dot(p, c.fwd)), 1.0f};
+    const Vec3 z = c.fwd * z_sign;
+    return {static_cast<float>(c.right.x), static_cast<float>(c.up.x), static_cast<float>(z.x), 0.0f,
+            static_cast<float>(c.right.y), static_cast<float>(c.up.y), static_cast<float>(z.y), 0.0f,
+            static_cast<float>(c.right.z), static_cast<float>(c.up.z), static_cast<float>(z.z), 0.0f,
+            static_cast<float>(-dot(p, c.right)), static_cast<float>(-dot(p, c.up)), static_cast<float>(-dot(p, z)), 1.0f};
 }
 
 // Signed yaw about world up from a to b, and elevation of a forward vector.

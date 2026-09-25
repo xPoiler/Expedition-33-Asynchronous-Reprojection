@@ -370,8 +370,9 @@ void render_thread() {
             std::memcpy(projection.data(), source_camera.view_to_clip, sizeof(projection));
             auto inputs = renderer.latewarp_inputs(source, settings.use_ui_tags != 0);
             inputs.depth_inverted = source_camera.depth_inverted != 0;
-            warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin), view_matrix(source_basis, origin),
-                                       projection);
+            const double z_sign = view_z_sign(source_camera.view_to_clip);
+            warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
+                                       view_matrix(source_basis, origin, z_sign), projection);
             if (warped) first_eval = false;
         }
         g_app.has_frames = source.valid;

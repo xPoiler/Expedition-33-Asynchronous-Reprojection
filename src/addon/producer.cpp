@@ -198,9 +198,11 @@ void Producer::on_constants(std::uint64_t frame, const Camera& camera) {
         double t[3] = {motion.translation[0], motion.translation[1], motion.translation[2]};
         const double step = std::sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
         if (have_prev_camera_ && frame == prev_frame_ + 1 && !camera.reset && motion.valid && step < 1000.0) {
-            // t is the current camera position in the previous frame's view space (x right, y up, z fwd).
+            // t is the current camera position in the previous frame's view space: x right, y up, z forward
+            // (Unreal) or backward (right-handed engines such as RE Engine, where clip.w = -z).
+            const double z_sign = camera.view_to_clip[11] < 0.0f ? -1.0 : 1.0;
             for (int i = 0; i < 3; ++i)
-                world_pos_[i] += t[0] * prev_right_[i] + t[1] * prev_up_[i] + t[2] * prev_fwd_[i];
+                world_pos_[i] += t[0] * prev_right_[i] + t[1] * prev_up_[i] + z_sign * t[2] * prev_fwd_[i];
         } else {
             ++position_epoch_;  // discontinuity (cut, reset, dropped frame): the presenter restarts its history
         }

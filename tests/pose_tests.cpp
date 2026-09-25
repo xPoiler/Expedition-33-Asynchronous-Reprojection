@@ -29,6 +29,30 @@ static void rotation_conventions() {
     EXPECT(std::fabs(z - 1.0) < 1e-6, "forward maps to +z (%f)", z);
 }
 
+// Right-handed engines (RE Engine): Y up, the camera looks down view -z and the projection has
+// clip.w = -z. A point ahead and to the right must land in front of the camera, on the right.
+static void right_handed_projection() {
+    const float near_plane = 0.01f;
+    const float rh[16] = {1.18f, 0, 0, 0, 0, 2.1f, 0, 0, 0, 0, 0, -1, 0, 0, near_plane, 0};  // row-vector, reversed-Z infinite
+    const float ue[16] = {0.98f, 0, 0, 0, 0, 1.73f, 0, 0, 0, 0, 0, 1, 0, 0, 10.0f, 0};
+    EXPECT(view_z_sign(rh) == -1.0 && view_z_sign(ue) == 1.0, "z sign from the projection's w column");
+    const CameraBasis cam{{3, 1, 2}, {1, 0, 0}, {0, 1, 0}, {0, 0, -1}};  // right x up = -fwd
+    const Vec3 point = cam.pos + cam.fwd * 10.0 + cam.right * 0.5;
+    auto project = [&](double z_sign, double& x_ndc, double& w) {
+        const Mat4 v = view_matrix(cam, {}, z_sign);
+        const double p[4] = {point.x, point.y, point.z, 1.0};
+        double view[4]{}, clip[4]{};
+        for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) view[c] += p[r] * v[r * 4 + c];
+        for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) clip[c] += view[r] * rh[r * 4 + c];
+        w = clip[3]; x_ndc = clip[0] / clip[3];
+    };
+    double x = 0, w = 0;
+    project(view_z_sign(rh), x, w);
+    EXPECT(w > 0 && x > 0, "right-handed: point ahead-right projects in front (w %.3f) and right (x %.3f)", w, x);
+    project(1.0, x, w);
+    EXPECT(w < 0, "the Unreal-style view with a right-handed projection puts the scene behind the camera (w %.3f)", w);
+}
+
 // A game whose camera follows target = gain * counts through a first-order lag (like E33),
 // rendering at `fps` and consuming input `delay` after each simulation start.
 struct Game {
@@ -187,6 +211,7 @@ static void world_up_detection() {
 
 int main() {
     rotation_conventions();
+    right_handed_projection();
     fit_recovers_smoothed_camera();
     prediction_is_accurate_and_continuous();
     cursor_gate_blocks_mouse();
