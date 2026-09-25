@@ -14,7 +14,7 @@ work but are untested.
 
 ## Requirements
 
-* An NVIDIA RTX GPU, with the monitor connected to it.
+* An NVIDIA RTX GPU rendering the game
 * Windows 11 (tested; Windows 10 may work) with **Hardware-accelerated GPU scheduling** turned on (Settings > System >
   Display > Graphics).
 * [ReShade](https://reshade.me) 6.x **with full add-on support**, installed for the game.
