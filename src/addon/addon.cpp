@@ -182,15 +182,6 @@ void draw_overlay(effect_runtime*) {
         if (ImGui::Checkbox("Invert warp (debug)", &invert)) s.invert_warp = invert;
         bool ui = s.use_ui_tags != 0;
         if (ImGui::Checkbox("Keep HUD still (HUD-less + UI tags)", &ui)) s.use_ui_tags = ui;
-        bool objects = s.extrapolate_objects != 0;
-        if (ImGui::Checkbox("Extrapolate moving objects (experimental)", &objects)) s.extrapolate_objects = objects;
-        if (objects) {
-            if (p.mv_scale_x != 0.0f)
-                ImGui::TextDisabled("  motion vectors: scale %.3g x %.3g, fit %.2f | moving pixels %.1f%%", p.mv_scale_x, p.mv_scale_y,
-                                    p.mv_fit_quality, p.moving_fraction * 100.0f);
-            else
-                ImGui::TextDisabled("  learning the game's motion vectors: turn the camera (fit %.2f)", p.mv_fit_quality);
-        }
         ImGui::Separator();
         ImGui::Text("Camera model  yaw: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
                     p.calibrated_x ? "fitted" : "learning", p.gain_x * 1000.0f, p.tau_x_ms, p.fit_quality_x);

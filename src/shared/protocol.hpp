@@ -75,7 +75,7 @@ struct Settings {
     std::uint32_t auto_prediction; // 0: manual slider; 1, 2, 4: -(1/n of the measured game frame)
     float present_lead_ms;         // render this long before the next vblank (0: right after the previous one)
     std::uint32_t gpu_priority;    // presenter GPU scheduling class: 0 realtime (default), 1 high, 2 normal
-    std::uint32_t extrapolate_objects;  // experimental: move objects along their own motion between game frames
+    std::uint32_t extrapolate_objects;  // shelved experiment (no UI): interpolate moving objects with the game's motion vectors
     std::uint32_t pad;
 };
 
