@@ -32,41 +32,37 @@ std::uint32_t to_dxgi_color_space(color_space cs) {
 void launch_presenter() {
     if (g_presenter_launched) return;
     g_presenter_launched = true;
-    // No existence pre-check: mod loaders (e.g. REFramework) hook the game's file APIs and can make the
-    // presenter look missing to GetFileAttributes.
-    const std::wstring args = L"--pid " + std::to_wstring(GetCurrentProcessId());
-    std::wstring cmd = L"\"" + g_presenter_path + L"\" " + args;
-    const std::wstring dir = g_presenter_path.substr(0, g_presenter_path.find_last_of(L"\\/"));
-    STARTUPINFOW si{sizeof(si)};
-    PROCESS_INFORMATION pi{};
-    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi)) {
-        CloseHandle(pi.hThread);
-        g_presenter_process = pi.hProcess;
-        return;
-    }
-    const DWORD error = GetLastError();
-    // Some games' DRM or mod loaders redirect file opens inside the game folder, so the game process
-    // cannot start the presenter itself. Let the system's cmd.exe (outside the game folder, in its own
-    // unhooked process) start it; the presenter then reports its pid through shared memory.
-    wchar_t system_dir[MAX_PATH]{};
-    GetSystemDirectoryW(system_dir, MAX_PATH);
-    const std::wstring shell = std::wstring(system_dir) + L"\\cmd.exe";
-    std::wstring relay = L"\"" + shell + L"\" /d /c start \"\" /b \"" + g_presenter_path + L"\" " + args;
-    if (CreateProcessW(shell.c_str(), relay.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi)) {
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        g_producer->set_message("Presenter started through cmd.exe (the game blocked starting it directly)");
-        return;
+    // Next to the add-on first. Some games (e.g. RE9's launcher) copy the DLLs from the game folder into a
+    // staging folder and load them from there without subfolders, so also look next to the game's exe.
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring exe_dir = exe;
+    exe_dir = exe_dir.substr(0, exe_dir.find_last_of(L"\\/"));
+    const std::wstring candidates[] = {g_presenter_path, exe_dir + L"\\FrameWarp\\FrameWarpPresenter.exe"};
+    const std::wstring args = L" --pid " + std::to_wstring(GetCurrentProcessId());
+    DWORD error = ERROR_FILE_NOT_FOUND;
+    for (const auto& path : candidates) {
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        std::wstring cmd = L"\"" + path + L"\"" + args;
+        const std::wstring dir = path.substr(0, path.find_last_of(L"\\/"));
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi)) {
+            CloseHandle(pi.hThread);
+            g_presenter_process = pi.hProcess;
+            return;
+        }
+        error = GetLastError();
     }
     char text[512];
-    std::snprintf(text, sizeof(text), "Failed to start the presenter (Windows error %lu, then %lu through cmd.exe): %ls", error,
-                  GetLastError(), g_presenter_path.c_str());
+    std::snprintf(text, sizeof(text), "Failed to start the presenter (Windows error %lu). Looked in: %ls ; %ls", error,
+                  candidates[0].c_str(), candidates[1].c_str());
     g_producer->set_message(text);
 }
 
 bool presenter_running() {
     if (g_presenter_process && WaitForSingleObject(g_presenter_process, 0) == WAIT_TIMEOUT) return true;
-    // Started some other way (relay, or by hand): adopt the presenter that registered in shared memory.
+    // Started some other way (e.g. by hand): adopt the presenter that registered in shared memory.
     const LONG pid = g_producer && g_producer->shared() ? g_producer->shared()->presenter.pid : 0;
     if (!pid) return false;
     if (HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid))) {

@@ -118,6 +118,8 @@ function Set-Cvar([string]$ini, [bool]$enable) {
 if ($Uninstall) {
     $info = if (Test-Path $record) { Get-Content -Raw $record | ConvertFrom-Json } else { $null }
     Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $binDir "FrameWarp.addon64")
+    # Some games copy their DLLs into a staging folder at launch (RE9: _storage_); remove those copies too.
+    Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Filter "FrameWarp.addon64" | Remove-Item -Force -ErrorAction SilentlyContinue
     $old = Join-Path $target "disabled\ReprojectionDiagnostics.addon64"
     if (Test-Path $old) { Move-Item -Force $old $binDir }
     if ($info -and $info.engine_ini) { Set-Cvar $info.engine_ini $false; Write-Host "Engine.ini: removed $cvar ($($info.engine_ini))" }
