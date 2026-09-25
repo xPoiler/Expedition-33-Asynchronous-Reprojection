@@ -136,9 +136,12 @@ if ($running) { throw "Close the game first ($(($running | ForEach-Object Proces
 function Find-EngineIni {
     if ((Split-Path -Leaf $binDir) -notmatch '^Win64$|^WinGDK$') { return $null }
     $project = Split-Path -Leaf (Split-Path -Parent (Split-Path -Parent $binDir))
-    foreach ($platform in @("Windows", "WindowsNoEditor", "WinGDK")) {
-        $dir = Join-Path $env:LOCALAPPDATA "$project\Saved\Config\$platform"
-        if (Test-Path $dir) { return Join-Path $dir "Engine.ini" }
+    # Usually <Project>\Saved, but some games add a store level (Returnal: Returnal\Steam\Saved).
+    foreach ($base in @((Join-Path $env:LOCALAPPDATA $project)) + @(Get-ChildItem -Directory -ErrorAction SilentlyContinue (Join-Path $env:LOCALAPPDATA $project) | ForEach-Object FullName)) {
+        foreach ($platform in @("Windows", "WindowsNoEditor", "WinGDK")) {
+            $dir = Join-Path $base "Saved\Config\$platform"
+            if (Test-Path $dir) { return Join-Path $dir "Engine.ini" }
+        }
     }
     return $null
 }
