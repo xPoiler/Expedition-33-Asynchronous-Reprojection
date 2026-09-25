@@ -79,7 +79,6 @@ diagnostics) are for fine-tuning and troubleshooting.
   cadence.
 * During fast turns, the screen edges show fill for areas the game never rendered.
 * Very fast motion goes beyond what re-projecting a single frame can hide.
-* The display must be connected to the NVIDIA GPU.
 * The Expedition 33 support targets the current Steam build. It switches itself off safely if a game
   update changes the relevant code.
 

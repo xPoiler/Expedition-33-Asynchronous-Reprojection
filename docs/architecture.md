@@ -68,7 +68,9 @@
   the swapchain frees a buffer.
 * **Output.** A layered, transparent, no-activate, topmost window follows the game's client area; a
   DirectComposition visual holds a flip-model composition swapchain (3 buffers, max latency 1,
-  waitable). The window is hidden when the game is not in front or no frames are available.
+  waitable). The window is hidden when the game is not in front or no frames are available. The
+  monitor may be driven by another GPU: rendering stays on the game's GPU and Windows composes the
+  overlay onto whichever display shows it.
 
 ## Camera model (`pose.hpp`)
 
