@@ -9,8 +9,14 @@ camera is *now*, using NVIDIA's Reflex 2 Frame Warp engine. It runs as a ReShade
 camera, depth and HUD data from the game's own NVIDIA Streamline (DLSS/Reflex) integration. It then
 draws the result in a click-through overlay above the game.
 
-**Supported game:** *Clair Obscur: Expedition 33* (Steam). Other games that use NVIDIA Streamline may
-work but are untested.
+## Tested games
+
+| Game | Notes |
+|---|---|
+| *Clair Obscur: Expedition 33* (Steam) | Add the launch options `-slforcetagging -slviewextension` (see Install). The HUD stays still while the scene is warped. |
+| *Resident Evil Requiem* (Steam) | **Requires [REFramework](https://github.com/praydog/REFramework)**: without it the game's DRM crashes with ReShade. The game doesn't provide separate HUD layers, so the HUD moves with the warp. |
+
+Other games that use NVIDIA Streamline for DLSS may work but are untested.
 
 ## Requirements
 
@@ -33,25 +39,22 @@ work but are untested.
    [Releases](https://github.com/xPoiler/Expedition-33-Asynchronous-Reprojection/releases) and
    extract it.
 2. Put `nvngx_latewarp.dll` next to `install.bat`.
-3. Close the game. Run `install.bat` with the game's Steam folder name, or with its install folder:
-   ```
-   install.bat "Expedition 33"
-   install.bat "D:\Games\Some Game"
-   ```
-   The installer finds the game's ReShade and copies FrameWarp next to it. For Unreal Engine games,
-   it also enables Streamline resource tagging in the game's `Engine.ini`. A backup of the file is
-   kept.
+3. Close the game and double-click `install.bat`. It lists your Steam games that have ReShade; type
+   the number of the game and press Enter. For a non-Steam game, choose **P** and type its folder.
+   The installer copies FrameWarp next to the game's ReShade. For Unreal Engine games, it also
+   enables Streamline resource tagging in the game's `Engine.ini`, keeping a backup of the file.
 4. **Unreal Engine games** (including Expedition 33): add these launch options (Steam > game >
    Properties > Launch Options):
    ```
    -slforcetagging -slviewextension
    ```
 
-To uninstall, run `uninstall.bat "Expedition 33"`, or pass the game folder. It reverts everything the
-installer changed.
+To uninstall, double-click `uninstall.bat` and choose the game. It reverts everything the installer
+changed.
 
-Advanced: `install.ps1` accepts `-Game`, `-GameDir`, `-Latewarp <dll>`, `-EngineIni <path>`,
-`-NoCvar` and `-Uninstall`.
+Advanced: both files also accept a game name or folder directly (`install.bat "Expedition 33"`), and
+`install.ps1` accepts `-Game`, `-GameDir`, `-Latewarp <dll>`, `-EngineIni <path>`, `-NoCvar` and
+`-Uninstall`.
 
 ## Use
 

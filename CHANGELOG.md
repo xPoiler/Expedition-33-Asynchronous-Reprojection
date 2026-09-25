@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.0
+
+* **Resident Evil Requiem support** (requires REFramework).
+* Works with right-handed engines such as RE Engine: the camera axis convention is now read from the
+  game's projection, which fixes a doubled, smeared image during camera motion there. Unreal Engine
+  games behave exactly as before.
+* The add-on also finds the presenter next to the game's executable. This fixes "presenter not
+  found" in games that load their DLLs from a staging folder (RE9's `_storage_`).
+* Installer: double-click `install.bat` or `uninstall.bat` to choose the game from a numbered list of
+  detected Steam games, or type a folder for non-Steam games.
+* Installer: picks the live ReShade when a mod manager keeps backup copies. Uninstall also removes
+  the add-on copies a game makes in its staging folder.
+* The "presenter failed to start" message now shows the Windows error and the paths that were tried.
+
 ## 1.0.0
 
 First release.

@@ -1,10 +1,9 @@
 @echo off
-rem Usage: uninstall.bat "Steam game folder name"   or   uninstall.bat "C:\path\to\game"
+rem Double-click to pick a game from a list, or: uninstall.bat "Expedition 33"  /  uninstall.bat "D:\Games\Some Game"
+title FrameWarp uninstaller
 if "%~1"=="" (
-  echo Usage: uninstall.bat "Expedition 33"
-  exit /b 1
-)
-if exist "%~1\" (
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1" -Uninstall
+) else if exist "%~1\" (
   powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1" -GameDir "%~1" -Uninstall
 ) else (
   powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1" -Game "%~1" -Uninstall

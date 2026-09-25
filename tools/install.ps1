@@ -52,7 +52,53 @@ if ($GameDir) {
     if ($found.Count -gt 1) { throw "'$Game' matches several games: $(($found | ForEach-Object Name) -join ', ')" }
     $GameDir = $found[0].FullName
 } else {
-    throw "Pass -Game <Steam folder name> or -GameDir <folder or exe>."
+    # No game given (double-clicked install.bat / uninstall.bat): list the Steam games that can be chosen.
+    if (-not $Uninstall -and -not ($Latewarp -and (Test-Path -PathType Leaf $Latewarp)) -and
+        -not (Test-Path (Join-Path $build "FrameWarp\nvngx_latewarp.dll")) -and -not (Test-Path (Join-Path $build "nvngx_latewarp.dll"))) {
+        Write-Warning "nvngx_latewarp.dll is not next to install.bat. Put it there first (see README.md); without it only an existing install can be updated."
+    }
+    Write-Host "Scanning Steam libraries..."
+    $choices = @()
+    foreach ($dir in @(Get-SteamGameDirs | Sort-Object FullName -Unique)) {
+        $found = @(Get-ChildItem -Recurse -Depth 6 -File -ErrorAction SilentlyContinue $dir.FullName -Include ($reshadeNames + "FrameWarp.addon64", "sl.interposer.dll"))
+        $hasReShade = [bool]($found | Where-Object { $reshadeNames -contains $_.Name } | Where-Object { Test-ReShade $_.FullName })
+        $hasFrameWarp = [bool]($found | Where-Object { $_.Name -eq "FrameWarp.addon64" })
+        $hasStreamline = [bool]($found | Where-Object { $_.Name -eq "sl.interposer.dll" })
+        if (($Uninstall -and $hasFrameWarp) -or (-not $Uninstall -and $hasReShade)) {
+            $choices += [pscustomobject]@{ Name = $dir.Name; Path = $dir.FullName; FrameWarp = $hasFrameWarp; Streamline = $hasStreamline }
+        }
+    }
+    Write-Host ""
+    if ($choices.Count -eq 0) {
+        Write-Host $(if ($Uninstall) { "No Steam game with FrameWarp installed was found." } else { "No Steam game with ReShade was found. Install ReShade (with full add-on support) for the game first." })
+    } else {
+        Write-Host $(if ($Uninstall) { "Games with FrameWarp installed:" } else { "Games with ReShade:" })
+        for ($i = 0; $i -lt $choices.Count; ++$i) {
+            $c = $choices[$i]
+            $notes = @()
+            if (-not $Uninstall) {
+                if ($c.FrameWarp) { $notes += "FrameWarp installed (will update)" }
+                if (-not $c.Streamline) { $notes += "no Streamline: will not work" }
+            }
+            Write-Host ("  {0,2}) {1}{2}" -f ($i + 1), $c.Name, $(if ($notes) { "   [" + ($notes -join ", ") + "]" } else { "" }))
+        }
+    }
+    Write-Host "   P) Enter a game folder by hand (non-Steam games)"
+    Write-Host "   Q) Quit"
+    while (-not $GameDir) {
+        $answer = (Read-Host "Choose").Trim()
+        if ($answer -match '^[Qq]$') { Write-Host "Nothing changed."; return }
+        if ($answer -match '^[Pp]$') {
+            $typed = (Read-Host "Game folder (or the game's .exe)").Trim().Trim('"')
+            if (Test-Path -PathType Leaf $typed) { $typed = Split-Path -Parent $typed }
+            if ($typed -and (Test-Path -PathType Container $typed)) { $GameDir = $typed } else { Write-Host "Folder not found." }
+            continue
+        }
+        $n = 0
+        if ([int]::TryParse($answer, [ref]$n) -and $n -ge 1 -and $n -le $choices.Count) { $GameDir = $choices[$n - 1].Path }
+        else { Write-Host "Type a number from the list, P or Q." }
+    }
+    Write-Host ""
 }
 
 # ReShade's folder is where the add-on must go (it loads add-ons from its own directory).
