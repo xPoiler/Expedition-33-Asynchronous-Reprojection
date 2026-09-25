@@ -132,11 +132,11 @@ $running = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -a
 if ($running) { throw "Close the game first ($(($running | ForEach-Object ProcessName | Select-Object -Unique) -join ', '))." }
 
 # Unreal Engine layout: <Game>\<Project>\Binaries\Win64\<exe>. The user config lives in
-# %LOCALAPPDATA%\<Project>\Saved\Config\Windows (or WinGDK for Game Pass builds).
+# %LOCALAPPDATA%\<Project>\Saved\Config\Windows (UE5), WindowsNoEditor (UE4) or WinGDK (Game Pass).
 function Find-EngineIni {
     if ((Split-Path -Leaf $binDir) -notmatch '^Win64$|^WinGDK$') { return $null }
     $project = Split-Path -Leaf (Split-Path -Parent (Split-Path -Parent $binDir))
-    foreach ($platform in @("Windows", "WinGDK")) {
+    foreach ($platform in @("Windows", "WindowsNoEditor", "WinGDK")) {
         $dir = Join-Path $env:LOCALAPPDATA "$project\Saved\Config\$platform"
         if (Test-Path $dir) { return Join-Path $dir "Engine.ini" }
     }
