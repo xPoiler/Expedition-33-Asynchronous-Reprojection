@@ -39,11 +39,138 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
 }
 )";
 
+// Moving-object extrapolation. Work happens on the game's render-resolution grid (depth/motion
+// size); `rect` is the valid region. Motion is stored towards the previous frame, like the game's.
+const char kShadersX[] = R"(
+cbuffer X : register(b0) {
+    row_major float4x4 clip_to_prev;  // the game's clipToPrevClip (row vector: prev = clip * M)
+    uint4 rect;                       // valid render region: x, y, w, h
+    uint2 grid;                       // render texture size
+    uint2 mv_size;                    // motion vector texture size
+    uint2 out_size;                   // colour / output size
+    float2 mv_scale;                  // game motion vector -> uv
+    float alpha;                      // game frames to move objects forward (negative: back)
+    float threshold;                  // render px of own motion before a pixel counts as moving
+    uint groups_x;                    // analyze: groups per row; reduce: total groups
+    uint flags;                       // bit 0: mv_scale valid
+};
+
+float depth_key(float d) { return 1.0 + saturate((log2(max(d, 1e-30)) + 24.0) / 24.0) * 1022.0; }  // reversed-Z: nearer = larger
+
+Texture2D<float> depth_t : register(t0);
+Texture2D<float2> motion_t : register(t1);
+RWTexture2D<float4> object_u : register(u0);        // xy: own motion (render px, to previous frame), z: depth, w: moving
+RWStructuredBuffer<float4> partial_u : register(u1);
+groupshared float4 gs_a[64], gs_b[64];
+[numthreads(8, 8, 1)] void cs_analyze(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID) {
+    float4 a = 0, b = 0;
+    if (all(id.xy < grid)) {
+        float4 o = 0;
+        if (all(id.xy >= rect.xy) && all(id.xy < rect.xy + rect.zw)) {
+            const float2 uv = (float2(id.xy - rect.xy) + 0.5) / float2(rect.zw);
+            const float d = depth_t.Load(int3(id.xy, 0));
+            const float4 prev = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, d, 1), clip_to_prev);
+            const float2 cam = float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5) - uv;
+            const float2 g = motion_t.Load(int3(min(id.xy, mv_size - 1), 0));
+            if (prev.w > 0 && all(abs(g) < 1e4)) {
+                const float2 own = (g * mv_scale - cam) * float2(rect.zw);
+                const bool moving = (flags & 1) && dot(own, own) > threshold * threshold;
+                o = float4(own, d, moving ? 1 : 0);
+                a = float4(g.x * cam.x, g.x * g.x, cam.x * cam.x, 1);
+                b = float4(g.y * cam.y, g.y * g.y, cam.y * cam.y, moving ? 1 : 0);
+            }
+        }
+        object_u[id.xy] = o;
+    }
+    gs_a[gi] = a; gs_b[gi] = b;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = 32; s > 0; s >>= 1) {
+        if (gi < s) { gs_a[gi] += gs_a[gi + s]; gs_b[gi] += gs_b[gi + s]; }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) { const uint g = gid.y * groups_x + gid.x; partial_u[g * 2] = gs_a[0]; partial_u[g * 2 + 1] = gs_b[0]; }
+}
+
+RWStructuredBuffer<float4> reduce_in_u : register(u0);
+RWStructuredBuffer<float4> reduce_out_u : register(u1);
+groupshared float4 rs_a[256], rs_b[256];
+[numthreads(256, 1, 1)] void cs_reduce(uint gi : SV_GroupIndex) {
+    float4 a = 0, b = 0;
+    for (uint i = gi; i < groups_x; i += 256) { a += reduce_in_u[i * 2]; b += reduce_in_u[i * 2 + 1]; }
+    rs_a[gi] = a; rs_b[gi] = b;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) { rs_a[gi] += rs_a[gi + s]; rs_b[gi] += rs_b[gi + s]; }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) { reduce_out_u[0] = rs_a[0]; reduce_out_u[1] = rs_b[0]; }
+}
+
+RWTexture2D<uint> dest_u : register(u0);
+[numthreads(8, 8, 1)] void cs_clear(uint3 id : SV_DispatchThreadID) { if (all(id.xy < grid)) dest_u[id.xy] = 0; }
+
+// Forward splat: every moving pixel claims its position `alpha` frames ahead; the nearest one wins.
+Texture2D<float4> object_t : register(t0);
+[numthreads(8, 8, 1)] void cs_splat(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= grid)) return;
+    const float4 o = object_t.Load(int3(id.xy, 0));
+    if (o.w < 0.5) return;
+    const float2 move = -o.xy * alpha;
+    const int2 dst = int2(floor(float2(id.xy) + move + 0.5));
+    if (any(dst < int2(rect.xy)) || any(dst >= int2(rect.xy + rect.zw))) return;
+    const int2 off = clamp(dst - int2(id.xy), -1023, 1023);
+    const uint key = (uint(depth_key(o.z)) << 22) | (uint(off.x + 1024) << 11) | uint(off.y + 1024);
+    InterlockedMax(dest_u[dst], key);
+}
+
+// Gather at output resolution: moved object pixels, else the static image; where an object moved
+// away, pull background from behind it (along its motion), else keep the original pixel.
+Texture2D<uint> dest_t : register(t0);
+Texture2D<float4> object_g : register(t1);
+Texture2D<float4> colour_t : register(t2);
+Texture2D<float> depth_g : register(t3);
+RWTexture2D<float4> out_u : register(u0);
+[numthreads(8, 8, 1)] void cs_gather(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    const float2 scale = float2(out_size) / float2(rect.zw);
+    const int2 pr = int2(rect.xy) + int2(min(uint2((float2(id.xy) + 0.5) / scale), rect.zw - 1));
+    const uint key = dest_t.Load(int3(pr, 0));
+    const float4 here = object_g.Load(int3(pr, 0));
+    if (key != 0) {
+        const int2 off = int2((key >> 11) & 2047, key & 2047) - 1024;
+        const bool occluded = here.w < 0.5 && depth_key(depth_g.Load(int3(pr, 0))) > float(key >> 22) + 2.0;
+        if (!occluded) {
+            const int2 src = clamp(int2(id.xy) - int2(round(float2(off) * scale)), int2(0, 0), int2(out_size) - 1);
+            out_u[id.xy] = colour_t.Load(int3(src, 0));
+            return;
+        }
+    }
+    if (here.w > 0.5 && alpha != 0) {
+        const float2 behind = here.xy * alpha;  // opposite to where the object went
+        const float len = length(behind);
+        const float2 dir = behind / max(len, 1e-6);
+        const float step = max(1.0, len / 4.0);
+        [loop] for (int k = 1; k <= 8; ++k) {
+            const int2 q = clamp(pr + int2(round(dir * step * k)), int2(rect.xy), int2(rect.xy + rect.zw) - 1);
+            if (object_g.Load(int3(q, 0)).w < 0.5) {
+                const int2 src = clamp(int2(id.xy) + int2(round(dir * step * k * scale)), int2(0, 0), int2(out_size) - 1);
+                out_u[id.xy] = colour_t.Load(int3(src, 0));
+                return;
+            }
+        }
+    }
+    out_u[id.xy] = colour_t.Load(int3(id.xy, 0));
+}
+)";
+
 // Descriptor layout in the shader-visible heap.
 constexpr UINT kSrcSrv = 0;         // + slot * kTexCount + kind: shared textures
 constexpr UINT kPrivUav = 32;       // + private id
 constexpr UINT kPrivSrv = 48;       // + private id
-constexpr UINT kHeapSize = 64;
+// Extrapolation tables (4 SRVs t0-t3, 2 UAVs u0-u1 each).
+constexpr UINT kXAnalyzeSrv = 64, kXAnalyzeUav = 68, kXReduceUav = 70, kXSplatSrv = 72, kXSplatUav = 76;
+constexpr UINT kXGatherSrvHudless = 78, kXGatherSrvBackbuffer = 82, kXGatherUav = 86;
+constexpr UINT kHeapSize = 96;
 
 DXGI_FORMAT srv_format(DXGI_FORMAT f) {
     switch (f) {
@@ -69,9 +196,9 @@ DXGI_FORMAT swapchain_format(DXGI_FORMAT game) {
     }
 }
 
-ComPtr<ID3DBlob> compile(const char* entry, const char* target, std::string& error) {
+ComPtr<ID3DBlob> compile(const char* entry, const char* target, std::string& error, const char* source = kShaders) {
     ComPtr<ID3DBlob> code, messages;
-    if (FAILED(D3DCompile(kShaders, sizeof(kShaders) - 1, "framewarp.hlsl", nullptr, nullptr, entry, target,
+    if (FAILED(D3DCompile(source, std::strlen(source), "framewarp.hlsl", nullptr, nullptr, entry, target,
                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &messages))) {
         error = std::string("shader ") + entry + ": " + (messages ? static_cast<const char*>(messages->GetBufferPointer()) : "?");
         return nullptr;
@@ -221,8 +348,181 @@ bool Renderer::create_pipelines(std::string& error) {
     gd.NumRenderTargets = 1; gd.RTVFormats[0] = swap_format_;
     gd.SampleDesc.Count = 1;
     if (FAILED(device_->CreateGraphicsPipelineState(&gd, IID_PPV_ARGS(&blit_)))) { error = "blit pso"; return false; }
+
+    // Extrapolation passes: 32 constants, 4 SRVs, 2 UAVs.
+    D3D12_DESCRIPTOR_RANGE xsrv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0};
+    D3D12_DESCRIPTOR_RANGE xuav{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 0};
+    D3D12_ROOT_PARAMETER xp[3]{};
+    xp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; xp[0].Constants = {0, 0, 32};
+    xp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; xp[1].DescriptorTable = {1, &xsrv};
+    xp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; xp[2].DescriptorTable = {1, &xuav};
+    D3D12_ROOT_SIGNATURE_DESC xrs{3, xp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    blob.Reset(); err.Reset();
+    if (FAILED(D3D12SerializeRootSignature(&xrs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)) ||
+        FAILED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root_x_)))) {
+        error = "extrapolation root signature"; return false;
+    }
+    struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } xs[] = {
+        {"cs_analyze", &cs_analyze_}, {"cs_reduce", &cs_reduce_}, {"cs_clear", &cs_clear_}, {"cs_splat", &cs_splat_}, {"cs_gather", &cs_gather_}};
+    for (auto& x : xs) {
+        auto code = compile(x.entry, "cs_5_0", error, kShadersX);
+        if (!code) return false;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC xd{};
+        xd.pRootSignature = root_x_.Get();
+        xd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+        if (FAILED(device_->CreateComputePipelineState(&xd, IID_PPV_ARGS(x.pso->ReleaseAndGetAddressOf())))) { error = std::string(x.entry) + " pso"; return false; }
+    }
+    D3D12_HEAP_PROPERTIES def{}; def.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = 2 * 16; bd.Height = 1;
+    bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sums_)))) {
+        error = "motion fit buffer"; return false;
+    }
+    D3D12_HEAP_PROPERTIES rbh{}; rbh.Type = D3D12_HEAP_TYPE_READBACK;
+    bd.Width = 3 * 2 * 16; bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+    if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&fit_readback_)))) {
+        error = "motion fit readback"; return false;
+    }
     return true;
 }
+
+void Renderer::set_x_srv(UINT index, PrivateId id) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+    d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    d.Texture2D.MipLevels = 1;
+    const auto& p = private_[id];
+    d.Format = p.texture ? p.format : DXGI_FORMAT_R8G8B8A8_UNORM;
+    device_->CreateShaderResourceView(p.texture.Get(), &d, cpu(index));
+}
+
+void Renderer::set_x_uav(UINT index, PrivateId id) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
+    d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    const auto& p = private_[id];
+    d.Format = p.texture ? p.format : DXGI_FORMAT_R8G8B8A8_UNORM;
+    device_->CreateUnorderedAccessView(p.texture.Get(), nullptr, &d, cpu(index));
+}
+
+void Renderer::x_dispatch(ID3D12PipelineState* pso, const void* constants, UINT srv_table, UINT uav_table, UINT groups_x, UINT groups_y) {
+    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
+    list_->SetDescriptorHeaps(1, heaps);
+    list_->SetComputeRootSignature(root_x_.Get());
+    list_->SetPipelineState(pso);
+    list_->SetComputeRoot32BitConstants(0, 32, constants, 0);
+    list_->SetComputeRootDescriptorTable(1, gpu(srv_table));
+    list_->SetComputeRootDescriptorTable(2, gpu(uav_table));
+    list_->Dispatch(groups_x, groups_y, 1);
+}
+
+namespace {
+struct XConstants {
+    float clip_to_prev[16];
+    std::uint32_t rect[4], grid[2], mv_size[2], out_size[2];
+    float mv_scale[2], alpha, threshold;
+    std::uint32_t groups_x, flags;
+};
+static_assert(sizeof(XConstants) == 32 * 4, "root constants");
+}  // namespace
+
+void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid) {
+    if (!src.has_depth || !src.has_motion) return;
+    const auto& depth = private_[kPDepth];
+    const UINT w = depth.width, h = depth.height, gx = (w + 7) / 8, gy = (h + 7) / 8;
+    if (!ensure_private(kPObject, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT)) return;
+    if (partial_groups_ < gx * gy) {
+        wait_idle();
+        partials_.Reset();
+        D3D12_HEAP_PROPERTIES def{}; def.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = UINT64(gx) * gy * 2 * 16; bd.Height = 1;
+        bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&partials_)))) return;
+        partial_groups_ = gx * gy;
+    }
+    // Descriptors are rewritten each time; the resources behind them only change after wait_idle.
+    set_x_srv(kXAnalyzeSrv + 0, kPDepth);
+    set_x_srv(kXAnalyzeSrv + 1, kPMotion);
+    set_x_srv(kXAnalyzeSrv + 2, kPDepth);
+    set_x_srv(kXAnalyzeSrv + 3, kPDepth);
+    set_x_uav(kXAnalyzeUav + 0, kPObject);
+    auto buffer_uav = [&](UINT index, ID3D12Resource* r, UINT elements) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
+        d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; d.Format = DXGI_FORMAT_UNKNOWN;
+        d.Buffer.NumElements = elements; d.Buffer.StructureByteStride = 16;
+        device_->CreateUnorderedAccessView(r, nullptr, &d, cpu(index));
+    };
+    buffer_uav(kXAnalyzeUav + 1, partials_.Get(), partial_groups_ * 2);
+    buffer_uav(kXReduceUav + 0, partials_.Get(), partial_groups_ * 2);
+    buffer_uav(kXReduceUav + 1, sums_.Get(), 2);
+
+    XConstants c{};
+    std::memcpy(c.clip_to_prev, clip_to_prev_clip, sizeof(c.clip_to_prev));
+    const Rect2 r = src.depth_rect.w ? src.depth_rect : Rect2{0, 0, w, h};
+    c.rect[0] = r.x; c.rect[1] = r.y; c.rect[2] = std::min(r.w, w - r.x); c.rect[3] = std::min(r.h, h - r.y);
+    c.grid[0] = w; c.grid[1] = h;
+    c.mv_size[0] = private_[kPMotion].width; c.mv_size[1] = private_[kPMotion].height;
+    c.mv_scale[0] = scale_x; c.mv_scale[1] = scale_y;
+    c.threshold = 0.75f;
+    c.groups_x = gx;
+    c.flags = scale_valid ? 1u : 0u;
+    transition(private_[kPObject], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    x_dispatch(cs_analyze_.Get(), &c, kXAnalyzeSrv, kXAnalyzeUav, gx, gy);
+    D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = partials_.Get();
+    list_->ResourceBarrier(1, &uav);
+    c.groups_x = gx * gy;
+    x_dispatch(cs_reduce_.Get(), &c, kXAnalyzeSrv, kXReduceUav, 1, 1);
+    auto to_copy = transition_barrier(sums_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list_->ResourceBarrier(1, &to_copy);
+    list_->CopyBufferRegion(fit_readback_.Get(), UINT64(frame_index_) * 32, sums_.Get(), 0, 32);
+    std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+    list_->ResourceBarrier(1, &to_copy);
+    transition(private_[kPObject], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    fit_pending_[frame_index_] = true;
+}
+
+ID3D12Resource* Renderer::extrapolate_objects(const IngestedSource& src, bool from_hudless, float alpha) {
+    if (!src.has_depth || !src.has_motion || !private_[kPObject].texture) return nullptr;
+    const UINT w = private_[kPObject].width, h = private_[kPObject].height;
+    const PrivateId colour = from_hudless ? kPHudless : kPBackbuffer;
+    const UINT ow = private_[colour].width, oh = private_[colour].height;
+    if (!ensure_private(kPDest, w, h, DXGI_FORMAT_R32_UINT) || !ensure_private(kPExtrap, ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT)) return nullptr;
+    for (UINT i = 0; i < 4; ++i) set_x_srv(kXSplatSrv + i, kPObject);
+    set_x_uav(kXSplatUav + 0, kPDest);
+    set_x_uav(kXSplatUav + 1, kPDest);
+    const UINT gather = from_hudless ? kXGatherSrvHudless : kXGatherSrvBackbuffer;
+    set_x_srv(gather + 0, kPDest);
+    set_x_srv(gather + 1, kPObject);
+    set_x_srv(gather + 2, colour);
+    set_x_srv(gather + 3, kPDepth);
+    set_x_uav(kXGatherUav + 0, kPExtrap);
+    set_x_uav(kXGatherUav + 1, kPExtrap);
+
+    XConstants c{};
+    const Rect2 r = src.depth_rect.w ? src.depth_rect : Rect2{0, 0, w, h};
+    c.rect[0] = r.x; c.rect[1] = r.y; c.rect[2] = std::min(r.w, w - r.x); c.rect[3] = std::min(r.h, h - r.y);
+    c.grid[0] = w; c.grid[1] = h;
+    c.out_size[0] = ow; c.out_size[1] = oh;
+    c.alpha = alpha;
+    transition(private_[kPDest], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    x_dispatch(cs_clear_.Get(), &c, kXSplatSrv, kXSplatUav, (w + 7) / 8, (h + 7) / 8);
+    D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = private_[kPDest].texture.Get();
+    list_->ResourceBarrier(1, &uav);
+    x_dispatch(cs_splat_.Get(), &c, kXSplatSrv, kXSplatUav, (w + 7) / 8, (h + 7) / 8);
+    transition(private_[kPDest], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(private_[kPExtrap], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    x_dispatch(cs_gather_.Get(), &c, gather, kXGatherUav, (ow + 7) / 8, (oh + 7) / 8);
+    transition(private_[kPExtrap], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    return private_[kPExtrap].texture.Get();
+}
+
+bool Renderer::take_motion_fit(MotionFit& fit) {
+    if (!fit_ready_) return false;
+    fit = fit_latest_;
+    fit_ready_ = false;
+    return true;
+}
+
 
 bool Renderer::ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format) {
     auto& p = private_[id];
@@ -316,6 +616,20 @@ ID3D12GraphicsCommandList* Renderer::begin_frame() {
             readback_->Unmap(0, &none);
         }
     }
+    // Motion-vector fit sums recorded by analyze_motion in that frame.
+    if (fit_pending_[frame_index_] && fit_readback_) {
+        fit_pending_[frame_index_] = false;
+        float* f = nullptr;
+        D3D12_RANGE range{frame_index_ * 32, frame_index_ * 32 + 32};
+        if (SUCCEEDED(fit_readback_->Map(0, &range, reinterpret_cast<void**>(&f)))) {
+            const float* v = f + frame_index_ * 8;
+            fit_latest_.gc[0] = v[0]; fit_latest_.gg[0] = v[1]; fit_latest_.cc[0] = v[2]; fit_latest_.samples = v[3];
+            fit_latest_.gc[1] = v[4]; fit_latest_.gg[1] = v[5]; fit_latest_.cc[1] = v[6]; fit_latest_.moving = v[7];
+            fit_ready_ = true;
+            D3D12_RANGE none{0, 0};
+            fit_readback_->Unmap(0, &none);
+        }
+    }
     allocators_[frame_index_]->Reset();
     list_->Reset(allocators_[frame_index_].Get(), nullptr);
     if (timestamps_) list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2);
@@ -392,6 +706,12 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot) {
         ensure_private(kPDepth, dp.width, dp.height, DXGI_FORMAT_R32_FLOAT);
         ensure_private(kPMotion, dp.width, dp.height, DXGI_FORMAT_R16G16_FLOAT);
         convert(sources[kDepth], static_cast<DXGI_FORMAT>(dp.format), slot, kDepth, kPDepth, dp.width, dp.height);
+        const auto& mv = m.tex[kMotion];
+        if (sources[kMotion]) {
+            convert(sources[kMotion], static_cast<DXGI_FORMAT>(mv.format), slot, kMotion, kPMotion,
+                    std::min(mv.width, dp.width), std::min(mv.height, dp.height));
+            out.has_motion = true;
+        }
         out.depth_rect = {dp.ext_x, dp.ext_y, dp.ext_w, dp.ext_h};
         out.has_depth = true;
     }

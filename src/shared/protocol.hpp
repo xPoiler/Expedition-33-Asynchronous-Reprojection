@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 16;
+constexpr std::uint32_t kVersion = 17;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -75,7 +75,8 @@ struct Settings {
     std::uint32_t auto_prediction; // 0: manual slider; 1, 2, 4: -(1/n of the measured game frame)
     float present_lead_ms;         // render this long before the next vblank (0: right after the previous one)
     std::uint32_t gpu_priority;    // presenter GPU scheduling class: 0 realtime (default), 1 high, 2 normal
-    std::uint32_t pad[2];
+    std::uint32_t extrapolate_objects;  // experimental: move objects along their own motion between game frames
+    std::uint32_t pad;
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -90,7 +91,9 @@ struct PresenterStatus {
     float tau_x_ms, tau_y_ms, latency_ms, orbit_cm;
     float frame_interval_ms, effective_prediction_ms;
     float display_hz;  // measured refresh rate of the display the overlay is on (0 = not measured yet)
-    float pad3;
+    float mv_scale_x, mv_scale_y;  // fitted game motion vector -> uv scale (0: not fitted)
+    float mv_fit_quality;          // R^2 of the fit on the latest frames
+    float moving_fraction;         // share of pixels flagged as moving objects
     char message[256];
 };
 

@@ -109,6 +109,30 @@ struct VramMonitor {
     }
 };
 
+// Scale that maps the game's motion vectors to uv (per axis), fitted against the camera-only motion of
+// every pixel. Frames where the camera barely moves carry no information and are skipped.
+struct MotionVectorScale {
+    double gc[2] = {}, gg[2] = {}, cc[2] = {};
+    double scale[2] = {}, quality = 0, moving_fraction = 0;
+    bool valid = false;
+    void add(const MotionFit& f) {
+        if (f.samples < 1000) return;
+        moving_fraction = f.moving / f.samples;
+        const double motion = (f.cc[0] + f.cc[1]) / f.samples;  // mean squared camera motion, uv^2
+        if (motion < 1e-8) return;
+        for (int k = 0; k < 2; ++k) { gc[k] = gc[k] * 0.8 + f.gc[k]; gg[k] = gg[k] * 0.8 + f.gg[k]; cc[k] = cc[k] * 0.8 + f.cc[k]; }
+        double q = 1;
+        for (int k = 0; k < 2; ++k) {
+            if (gg[k] <= 0 || cc[k] <= 0) return;
+            scale[k] = gc[k] / gg[k];
+            const double residual = scale[k] * scale[k] * gg[k] - 2 * scale[k] * gc[k] + cc[k];
+            q = std::min(q, 1.0 - residual / cc[k]);
+        }
+        quality = q;
+        valid = quality > 0.5;
+    }
+};
+
 CameraBasis to_basis(const Camera& c) {
     auto v = [](const float* f) { return Vec3{f[0], f[1], f[2]}; };
     return {v(c.pos), normalize(v(c.right)), normalize(v(c.up)), normalize(v(c.fwd))};
@@ -227,6 +251,9 @@ void render_thread() {
     std::int64_t last_target_vblank = 0;
     bool pacing_paused = false;
     bool device_loss_logged = false;
+    MotionVectorScale mv_scale;
+    bool mv_scale_logged = false;
+    double last_mv_log = 0;
 
     while (g_app.running) {
         WaitForSingleObjectEx(renderer.waitable(), 100, FALSE);
@@ -350,6 +377,8 @@ void render_thread() {
                     for (float v : c.clip_to_prev_clip) std::fprintf(g_app.csv_sources, ",%.7g", v);
                     std::fputc('\n', g_app.csv_sources);
                 }
+                if (settings.extrapolate_objects && s.has_motion)
+                    renderer.analyze_motion(s, m.camera.clip_to_prev_clip, float(mv_scale.scale[0]), float(mv_scale.scale[1]), mv_scale.valid);
                 first_eval = true;
                 const double present_t = seconds(m.qpc_present);
                 if (last_source_present > 0) source_interval = present_t - last_source_present;
@@ -370,6 +399,15 @@ void render_thread() {
             std::memcpy(projection.data(), source_camera.view_to_clip, sizeof(projection));
             auto inputs = renderer.latewarp_inputs(source, settings.use_ui_tags != 0);
             inputs.depth_inverted = source_camera.depth_inverted != 0;
+            if (settings.extrapolate_objects && source.has_motion && mv_scale.valid) {
+                const double interval = g_app.model.frame_interval();
+                const float alpha = interval > 0 ? float(std::clamp(p.horizon / interval, -1.5, 1.5)) : 0.0f;
+                const bool split = inputs.hudless != inputs.backbuffer;
+                if (ID3D12Resource* moved = renderer.extrapolate_objects(source, split, alpha)) {
+                    inputs.hudless = moved;
+                    if (!split) inputs.backbuffer = moved;
+                }
+            }
             const double z_sign = view_z_sign(source_camera.view_to_clip);
             warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
                                        view_matrix(source_basis, origin, z_sign), projection);
@@ -405,6 +443,8 @@ void render_thread() {
         {
             const auto notes = renderer.take_notes();
             for (const auto& note : notes) logf("%s", note.c_str());
+            MotionFit fit;
+            if (renderer.take_motion_fit(fit)) mv_scale.add(fit);
             vram.poll(now, notes.empty() ? nullptr : "texture change");
         }
         if (now - stat_start >= 0.5) {
@@ -434,6 +474,15 @@ void render_thread() {
             st.orbit_cm = float(g_app.model.learned_orbit());
             st.frame_interval_ms = float(g_app.model.frame_interval() * 1000.0);
             st.effective_prediction_ms = float(g_app.model.effective_prediction() * 1000.0);
+            st.mv_scale_x = mv_scale.valid ? float(mv_scale.scale[0]) : 0.0f;
+            st.mv_scale_y = mv_scale.valid ? float(mv_scale.scale[1]) : 0.0f;
+            st.mv_fit_quality = float(mv_scale.quality);
+            st.moving_fraction = float(mv_scale.moving_fraction);
+            if (mv_scale.valid && (!mv_scale_logged || now - last_mv_log > 10.0)) {
+                logf("motion vectors: scale %.4g x %.4g (to uv), fit quality %.3f, moving pixels %.1f%%", mv_scale.scale[0], mv_scale.scale[1],
+                     mv_scale.quality, mv_scale.moving_fraction * 100.0);
+                mv_scale_logged = true; last_mv_log = now;
+            }
             {
                 LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
                 st.display_hz = vblank.period > 0 ? float(double(qf.QuadPart) / vblank.period) : 0.0f;

@@ -19,6 +19,14 @@ struct IngestedSource {
     bool has_hudless = false, has_ui = false, has_depth = false;
     std::uint32_t color_w = 0, color_h = 0;
     Rect2 color_rect, depth_rect;
+    bool has_motion = false;  // game motion vectors converted into the private motion texture
+};
+
+// Least-squares sums relating the game's motion vectors g to the camera-only motion c (uv per frame,
+// towards the previous frame) over one game frame; the scale that maps g to uv is sum(g*c) / sum(g*g).
+struct MotionFit {
+    double gc[2] = {}, gg[2] = {}, cc[2] = {};
+    double samples = 0, moving = 0;  // pixels used / pixels flagged as moving objects
 };
 
 class Renderer {
@@ -65,6 +73,15 @@ public:
     // DXGI frame statistics after the latest present (0 when unavailable).
     struct PresentStats { UINT last_present_count = 0, present_count = 0, present_refresh = 0, sync_refresh = 0; std::int64_t sync_qpc = 0; HRESULT hr = S_OK; };
     PresentStats present_stats() const { return present_stats_; }
+    // Moving-object extrapolation (experimental). Once per new game frame: per-pixel object motion
+    // (scaled game motion vectors minus the camera-only motion from depth + clipToPrevClip), plus the
+    // motion-vector scale fit (read back a few frames later, see take_motion_fit).
+    void analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid);
+    // Per output frame: moves object pixels `alpha` game frames forward (negative: back) into a copy of
+    // the hud-less colour (or the backbuffer). Returns the result, or nullptr when unavailable.
+    ID3D12Resource* extrapolate_objects(const IngestedSource& src, bool from_hudless, float alpha);
+    bool take_motion_fit(MotionFit& fit);
+
     // Test/diagnostic helper: synchronously reads back the warped output (RGBA16F) or private backbuffer.
     bool read_back(bool output, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h);
 
@@ -75,7 +92,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPCount };
 
     bool create_pipelines(std::string& error);
     bool ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format);
@@ -85,6 +102,9 @@ private:
     D3D12_GPU_DESCRIPTOR_HANDLE gpu(UINT index) const;
     void convert(ID3D12Resource* source, DXGI_FORMAT source_format, int slot, int kind, PrivateId target, std::uint32_t w, std::uint32_t h);
     void create_swapchain_views();
+    void set_x_srv(UINT index, PrivateId id);
+    void set_x_uav(UINT index, PrivateId id);
+    void x_dispatch(ID3D12PipelineState* pso, const void* constants, UINT srv_table, UINT uav_table, UINT groups_x, UINT groups_y);
 
     ComPtr<ID3D12Device> device_;
     ComPtr<ID3D12CommandQueue> queue_;
@@ -103,7 +123,13 @@ private:
     std::uint32_t width_ = 0, height_ = 0, frame_index_ = 0;
     const char* priority_name_ = "normal";
 
-    ComPtr<ID3D12RootSignature> root_;
+    ComPtr<ID3D12RootSignature> root_, root_x_;
+    ComPtr<ID3D12PipelineState> cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_;
+    ComPtr<ID3D12Resource> partials_, sums_, fit_readback_;
+    UINT partial_groups_ = 0;
+    bool fit_pending_[3] = {};
+    bool fit_ready_ = false;
+    MotionFit fit_latest_;
     ComPtr<ID3D12PipelineState> cs_color_, cs_depth_, blit_;
     ComPtr<ID3D12DescriptorHeap> heap_, rtv_heap_;
     UINT descriptor_size_ = 0, rtv_size_ = 0;

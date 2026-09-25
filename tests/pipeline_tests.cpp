@@ -240,6 +240,91 @@ int main(int argc, char** argv) {
         EXPECT(std::fabs(std::fabs(xts - x0) - 2 * expected_side) < 4.0, "parallax uses the NEW depth after a resolution change");
     }
 
+    // Moving-object extrapolation: static camera, the white bar's motion vectors say it moved 20 render
+    // px to the right since the previous frame. One frame ahead it must be 20 render px further right;
+    // the red bar (static) must not move.
+    {
+        ComPtr<ID3D12Fence> gf; game->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gf));
+        D3D12_RESOURCE_DESC md = cd; md.Width = DW; md.Height = DH; md.Format = DXGI_FORMAT_R16G16_FLOAT;
+        ComPtr<ID3D12Resource> motion;
+        game->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &md, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&motion));
+        ComPtr<ID3D12DescriptorHeap> mv_rtv;
+        D3D12_DESCRIPTOR_HEAP_DESC mh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        game->CreateDescriptorHeap(&mh, IID_PPV_ARGS(&mv_rtv));
+        game->CreateRenderTargetView(motion.Get(), nullptr, mv_rtv->GetCPUDescriptorHandleForHeapStart());
+        alloc->Reset();
+        list->Reset(alloc.Get(), nullptr);
+        const float none[4] = {0, 0, 0, 0}, moved[4] = {-20.0f / float(DW), 0, 0, 0};  // uv towards the previous frame
+        const LONG bx = LONG(DW / 2);
+        const D3D12_RECT bar{bx - 6, 0, bx + 6, LONG(DH)};
+        list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), none, 0, nullptr);
+        list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), moved, 1, &bar);
+        Camera still = cam;
+        for (int i = 0; i < 16; ++i) still.clip_to_prev_clip[i] = (i % 5 == 0) ? 1.0f : 0.0f;  // identity: camera did not move
+        const std::uint64_t fid = 100;
+        producer.on_constants(fid, still);
+        producer.on_tag(fid, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
+        producer.on_tag(fid, kMotion, motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, DW, DH, list.Get());
+        const auto token3 = producer.begin_present(backbuffer.Get(), list.Get());
+        list->Close();
+        queue->ExecuteCommandLists(1, lists);
+        producer.finish_present(queue.Get(), token3);
+        queue->Signal(gf.Get(), 1);
+        while (gf->GetCompletedValue() < 1) Sleep(1);
+        for (int i = 0; i < kSlots; ++i) if (sh.slots[i].state == kReady && sh.slots[i].frame_id == fid) slot = i;
+        EXPECT(sh.slots[slot].frame_id == fid && sh.slots[slot].tex[kMotion].valid, "frame with motion vectors published");
+
+        auto* l = renderer.begin_frame();
+        IngestedSource src = renderer.ingest(sh, slot);
+        EXPECT(src.has_motion, "motion vectors ingested");
+        renderer.analyze_motion(src, still.clip_to_prev_clip, 1.0f, 1.0f, true);
+        auto evaluate = [&](ID3D12GraphicsCommandList* list_now, float alpha, bool rendered) {
+            auto inputs = renderer.latewarp_inputs(src, true);
+            inputs.depth_inverted = true;
+            if (alpha != 0.0f) {
+                ID3D12Resource* result = renderer.extrapolate_objects(src, false, alpha);
+                EXPECT(result != nullptr, "extrapolation ran");
+                if (result) inputs.backbuffer = inputs.hudless = result;
+            }
+            latewarp.evaluate(list_now, inputs, rendered, view_matrix(source, {}), view_matrix(source, {}), projection);
+            renderer.finish_frame(true, 0);
+            renderer.read_back(true, px, w, h);
+        };
+        evaluate(l, 0.0f, true);
+        const double still_x = peak(px, w, h, true, 1), still_red = peak(px, w, h, false, 0);
+        MotionFit fit{};
+        for (int i = 0; i < 4 && !renderer.take_motion_fit(fit); ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); }
+        evaluate(renderer.begin_frame(), 1.0f, false);
+        const double moved_x = peak(px, w, h, true, 1), moved_red = peak(px, w, h, false, 0);
+        evaluate(renderer.begin_frame(), 0.5f, false);
+        const double half_x = peak(px, w, h, true, 1);
+        const double expected_move = 20.0 * double(W) / double(DW);
+        std::printf("object extrapolation: bar x=%.0f, +1 frame x=%.0f (expected +%.1f), +1/2 frame x=%.0f; red bar y %.0f -> %.0f; moving pixels %.0f of %.0f\n",
+                    still_x, moved_x, expected_move, half_x, still_red, moved_red, fit.moving, fit.samples);
+        EXPECT(std::fabs((moved_x - still_x) - expected_move) < 4.0, "moving object advances one frame of its own motion");
+        EXPECT(std::fabs((half_x - still_x) - expected_move / 2) < 4.0, "half a frame moves it half as far");
+        EXPECT(std::fabs(moved_red - still_red) < 1.5, "static geometry stays put");
+        EXPECT(fit.moving > 0.5 * 12 * DH && fit.moving < 2.0 * 12 * DH, "moving pixels = the bar (%.0f)", fit.moving);
+        // GPU cost per presented frame, with and without the per-frame extrapolation passes.
+        auto median_gpu = [&](float alpha) {
+            std::vector<float> ms;
+            for (int i = 0; i < 12; ++i) {
+                auto* lf = renderer.begin_frame();
+                auto inputs = renderer.latewarp_inputs(src, true);
+                inputs.depth_inverted = true;
+                if (alpha != 0.0f) if (ID3D12Resource* r = renderer.extrapolate_objects(src, false, alpha)) inputs.backbuffer = inputs.hudless = r;
+                latewarp.evaluate(lf, inputs, false, view_matrix(source, {}), view_matrix(source, {}), projection);
+                renderer.finish_frame(true, 0);
+                renderer.wait_idle();
+                if (i >= 4) ms.push_back(renderer.last_gpu_ms());
+            }
+            std::sort(ms.begin(), ms.end());
+            return ms[ms.size() / 2];
+        };
+        const float plain = median_gpu(0.0f), with_objects = median_gpu(0.5f);
+        std::printf("GPU per presented frame: %.3f ms plain, %.3f ms with object extrapolation (+%.3f)\n", plain, with_objects, with_objects - plain);
+    }
+
     // Timing: GPU time of a whole presenter frame (Latewarp + blit), steady state.
     // Every 4th frame takes in a new game frame (ingest + rendered-frame Latewarp), like 30 fps -> 120 Hz.
     double total = 0; int samples = 0;
