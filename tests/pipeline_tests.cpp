@@ -1,0 +1,285 @@
+// End-to-end GPU test of the transport + Latewarp path without a game:
+// "game" device A renders a synthetic frame and publishes it through fw::Producer exactly like the
+// add-on does (planar D32S8 depth at render resolution, RGBA8 backbuffer); device B runs the
+// presenter's Renderer + Latewarp12 and we check the warped marker moves by the expected amount.
+#include "addon/producer.hpp"
+#include "presenter/pose.hpp"
+#include "presenter/renderer.hpp"
+#include <cmath>
+#include <cstdio>
+#include <algorithm>
+#include <vector>
+
+using namespace fw;
+using Microsoft::WRL::ComPtr;
+
+static int failures = 0;
+#define EXPECT(cond, ...) do { if (!(cond)) { ++failures; std::printf("FAIL %s:%d: ", __FILE__, __LINE__); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
+
+static float half_to_float(std::uint16_t h) {
+    const std::uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 31, mant = h & 1023;
+    if (exp == 0) return (sign ? -1.f : 1.f) * std::ldexp(float(mant), -24);
+    if (exp == 31) return 0.f;
+    return (sign ? -1.f : 1.f) * std::ldexp(float(mant + 1024), int(exp) - 25);
+}
+
+// Column / row where the marker channel peaks (averaged over the central band).
+static double peak(const std::vector<std::uint16_t>& px, std::uint32_t w, std::uint32_t h, bool columns, int channel) {
+    double best = -1, pos = -1;
+    const std::uint32_t n = columns ? w : h;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        double sum = 0;
+        for (std::uint32_t j = (columns ? h : w) * 2 / 5; j < (columns ? h : w) * 3 / 5; ++j) {
+            const std::size_t idx = columns ? (std::size_t(j) * w + i) : (std::size_t(i) * w + j);
+            const float r = half_to_float(px[idx * 4 + 0]), g = half_to_float(px[idx * 4 + 1]), b = half_to_float(px[idx * 4 + 2]);
+            sum += channel == 0 ? (r - g) : (g + b + r) / 3.0;  // red bar vs white bar
+        }
+        if (sum > best) { best = sum; pos = i; }
+    }
+    return pos;
+}
+
+int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // Optional: pipeline_tests <width> <height> [depth fraction] runs the checks at that size (depth at 75%).
+    const std::uint32_t W = argc > 2 ? std::uint32_t(std::atoi(argv[1])) : 1280;
+    const std::uint32_t H = argc > 2 ? std::uint32_t(std::atoi(argv[2])) : 720;
+    const double depth_fraction = argc > 3 ? std::atof(argv[3]) : 0.75;
+    const std::uint32_t DW = std::uint32_t(W * depth_fraction), DH = std::uint32_t(H * depth_fraction);
+    ComPtr<IDXGIFactory6> factory;
+    CreateDXGIFactory2(0, IID_PPV_ARGS(&factory));
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 d; adapter->GetDesc1(&d);
+        if (d.VendorId == 0x10DE) break;
+        adapter.Reset();
+    }
+    if (!adapter) { std::printf("SKIP: no NVIDIA adapter\n"); return 0; }
+    ComPtr<ID3D12Device> game;
+    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&game)))) { std::printf("FAIL device\n"); return 1; }
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ComPtr<ID3D12CommandQueue> queue; game->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue));
+    ComPtr<ID3D12CommandAllocator> alloc; game->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
+    ComPtr<ID3D12GraphicsCommandList> list;
+    game->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list));
+
+    WNDCLASSW wc{}; wc.lpfnWndProc = DefWindowProcW; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"FwTest";
+    RegisterClassW(&wc);
+    HWND window = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, wc.lpszClassName, L"FrameWarp test", WS_POPUP, 0, 0, W, H, nullptr, nullptr, wc.hInstance, nullptr);
+
+    Producer producer;
+    EXPECT(producer.attach(game.Get()), "producer attach");
+    producer.set_swapchain(window, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+
+    // Synthetic game frame: dark background, white vertical bar at the center column, red horizontal bar.
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC cd{}; cd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; cd.Width = W; cd.Height = H;
+    cd.DepthOrArraySize = 1; cd.MipLevels = 1; cd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; cd.SampleDesc.Count = 1;
+    cd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ComPtr<ID3D12Resource> backbuffer, depth;
+    game->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_PRESENT, nullptr, IID_PPV_ARGS(&backbuffer));
+    D3D12_RESOURCE_DESC dd = cd; dd.Width = DW; dd.Height = DH; dd.Format = DXGI_FORMAT_R32G8X24_TYPELESS; dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE clear{}; clear.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; clear.DepthStencil.Depth = 0.01f;
+    game->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&depth));
+    ComPtr<ID3D12DescriptorHeap> rtv_heap, dsv_heap;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    game->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap));
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV; game->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_heap));
+    game->CreateRenderTargetView(backbuffer.Get(), nullptr, rtv_heap->GetCPUDescriptorHandleForHeapStart());
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{}; dsv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    game->CreateDepthStencilView(depth.Get(), &dsv, dsv_heap->GetCPUDescriptorHandleForHeapStart());
+
+    D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {backbuffer.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET};
+    list->ResourceBarrier(1, &b);
+    const float dark[4] = {0.1f, 0.1f, 0.1f, 1}, white[4] = {1, 1, 1, 1}, red[4] = {1, 0, 0, 1};
+    const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    list->ClearRenderTargetView(rtv, dark, 0, nullptr);
+    const D3D12_RECT vbar{LONG(W / 2 - 4), 0, LONG(W / 2 + 4), LONG(H)};
+    const D3D12_RECT hbar{0, LONG(H / 2 - 4), LONG(W), LONG(H / 2 + 4)};
+    list->ClearRenderTargetView(rtv, red, 1, &hbar);
+    list->ClearRenderTargetView(rtv, white, 1, &vbar);
+    list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 0.01f, 0, 0, nullptr);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    list->ResourceBarrier(1, &b);
+
+    // UE-style camera: fwd +X, right +Y, up +Z; reversed infinite projection, 90 deg vertical FOV.
+    const float aspect = float(W) / float(H), znear = 10.0f;
+    Camera cam{};
+    const float proj[16] = {1.0f / aspect, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, znear, 0};
+    std::memcpy(cam.view_to_clip, proj, sizeof(proj));
+    cam.right[1] = 1; cam.up[2] = 1; cam.fwd[0] = 1;
+    cam.near_plane = znear; cam.fov = 1.5708f; cam.aspect = aspect; cam.depth_inverted = 1;
+    producer.on_constants(7, cam);
+    producer.on_tag(7, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
+    const auto token = producer.begin_present(backbuffer.Get(), list.Get());
+    EXPECT(token != 0, "begin_present found the frame");
+    list->Close();
+    ID3D12CommandList* lists[] = {list.Get()};
+    queue->ExecuteCommandLists(1, lists);
+    producer.finish_present(queue.Get(), token);
+    const Shared& sh = *producer.shared();
+    int slot = -1;
+    for (int i = 0; i < kSlots; ++i) if (sh.slots[i].state == kReady && sh.slots[i].frame_id == 7) slot = i;
+    EXPECT(slot >= 0, "slot published");
+    if (slot < 0) return 1;
+    EXPECT(sh.slots[slot].tex[kDepth].format == DXGI_FORMAT_R32G8X24_TYPELESS, "depth copied in its planar typeless format");
+
+    Renderer renderer;
+    std::string error;
+    if (!renderer.init(sh.adapter, window, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, 0, error)) { std::printf("FAIL renderer: %s\n", error.c_str()); return 1; }
+    std::printf("presenter queue priority: %s\n", renderer.queue_priority());
+    EXPECT(renderer.open_session(sh.producer_pid, sh.session, error), "open session: %s", error.c_str());
+    Latewarp12 latewarp;
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const auto dir = std::filesystem::path(exe).parent_path();
+    if (!latewarp.initialize(renderer.device(), dir, dir / L"logs")) { std::printf("FAIL latewarp: %s\n", latewarp.status().c_str()); return 1; }
+
+    const CameraBasis source{{0, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 0, 0}};
+    Mat4 projection; std::memcpy(projection.data(), proj, sizeof(proj));
+    auto run = [&](bool first, double yaw, double pitch, std::vector<std::uint16_t>& px, std::uint32_t& w, std::uint32_t& h, double side = 0.0) {
+        auto* l = renderer.begin_frame();
+        IngestedSource src{};
+        if (first) src = renderer.ingest(sh, slot);
+        static IngestedSource kept; if (first) kept = src;
+        EXPECT(kept.valid && kept.has_depth, "ingest valid=%d depth=%d", kept.valid, kept.has_depth);
+        CameraBasis target = apply_rotation(source, {0, 0, 1}, yaw, pitch, source.pos);
+        target.pos = target.pos + target.right * side;  // sideways move: parallax depends on depth
+        auto inputs = renderer.latewarp_inputs(kept, true);
+        inputs.depth_inverted = true;
+        const bool ok = latewarp.evaluate(l, inputs, first, view_matrix(target, {}), view_matrix(source, {}), projection);
+        EXPECT(ok, "evaluate: %s", latewarp.status().c_str());
+        renderer.finish_frame(ok, 0);
+        renderer.read_back(true, px, w, h);
+    };
+    std::vector<std::uint16_t> px; std::uint32_t w = 0, h = 0;
+    run(true, 0, 0, px, w, h);
+    const double x0 = peak(px, w, h, true, 1), y0 = peak(px, w, h, false, 0);
+    std::printf("identity: bar x=%.0f, red bar y=%.0f\n", x0, y0);
+    EXPECT(std::fabs(x0 - W / 2.0) <= 5 && std::fabs(y0 - H / 2.0) <= 5, "identity keeps markers centred");
+
+    const double yaw = 5.0 * 3.14159265 / 180.0;
+    const double expected = std::tan(yaw) / aspect * (W / 2.0);
+    run(false, yaw, 0, px, w, h);
+    const double x1 = peak(px, w, h, true, 1);
+    std::printf("yaw +5 deg: bar x=%.0f (shift %.1f px, |expected| %.1f)\n", x1, x1 - x0, expected);
+    EXPECT(std::fabs(std::fabs(x1 - x0) - expected) < 4.0, "yaw shift magnitude");
+    // Turning right (towards +right) must move the scene left.
+    EXPECT(x1 < x0, "yaw direction: scene moves opposite to the turn");
+
+    run(false, 0, yaw, px, w, h);
+    const double y1 = peak(px, w, h, false, 0);
+    const double expected_y = std::tan(yaw) * (H / 2.0);
+    std::printf("pitch +5 deg: red bar y=%.0f (shift %.1f px, |expected| %.1f)\n", y1, y1 - y0, expected_y);
+    EXPECT(std::fabs(std::fabs(y1 - y0) - expected_y) < 4.0, "pitch shift magnitude");
+    EXPECT(y1 > y0, "looking up moves the scene down");
+
+    // A "rendered frame" evaluation (first use of a new source) must warp exactly like the others:
+    // the presenter's first output after every new game frame is such an evaluation.
+    run(true, yaw, 0, px, w, h);
+    const double xr = peak(px, w, h, true, 1);
+    run(false, yaw, 0, px, w, h);
+    const double xr2 = peak(px, w, h, true, 1);
+    run(false, yaw, 0, px, w, h);
+    const double xr3 = peak(px, w, h, true, 1);
+    std::printf("yaw +5 deg with IsRenderedFrame=1: bar x=%.0f, then same pose again: %.0f, %.0f\n", xr, xr2, xr3);
+    EXPECT(std::fabs(xr - x1) < 3.0, "rendered-frame evaluation warps like any other (got %.0f, expected %.0f)", xr, x1);
+
+    // Parallax: a sideways camera move shifts the scene by (move / distance). The test depth is cleared
+    // to 0.01 with near plane 10 (reversed-Z infinite): distance 1000 units.
+    const double side = 50.0;
+    const double expected_side = (side / 1000.0) / aspect * (W / 2.0);
+    run(false, 0, 0, px, w, h, side);
+    const double xt = peak(px, w, h, true, 1);
+    std::printf("sideways move %.0f units: bar x=%.0f (shift %.1f px, |expected| %.1f)\n", side, xt, xt - x0, expected_side);
+    EXPECT(std::fabs(std::fabs(xt - x0) - expected_side) < 4.0, "translation parallax uses depth");
+
+    // The game changes its render resolution (DLSS preset): depth arrives at a new size, possibly
+    // smaller. Rotation and depth-dependent parallax must stay correct and the device must survive.
+    // Sizes seen in E33: Ultra Performance 1/3, Performance 1/2, Balanced ~0.58, Quality ~0.67, both directions.
+    for (const double scale : {0.5, 0.9, 0.334, 0.5, 0.58, 0.668, 0.5}) {
+        ComPtr<ID3D12Fence> gf; game->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gf));
+        queue->Signal(gf.Get(), 1);
+        while (gf->GetCompletedValue() < 1) Sleep(1);
+        const UINT DW2 = UINT(W * scale), DH2 = UINT(H * scale);
+        D3D12_RESOURCE_DESC dd2 = dd; dd2.Width = DW2; dd2.Height = DH2;
+        ComPtr<ID3D12Resource> depth2;
+        // Different content from the original depth (distance 500 instead of 1000): reading a stale depth
+        // texture would show the old parallax.
+        D3D12_CLEAR_VALUE clear2 = clear; clear2.DepthStencil.Depth = 0.02f;
+        game->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &dd2, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear2, IID_PPV_ARGS(&depth2));
+        ComPtr<ID3D12DescriptorHeap> dsv2_heap;
+        D3D12_DESCRIPTOR_HEAP_DESC hd2{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        game->CreateDescriptorHeap(&hd2, IID_PPV_ARGS(&dsv2_heap));
+        game->CreateDepthStencilView(depth2.Get(), &dsv, dsv2_heap->GetCPUDescriptorHandleForHeapStart());
+        alloc->Reset();
+        list->Reset(alloc.Get(), nullptr);
+        list->ClearDepthStencilView(dsv2_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 0.02f, 0, 0, nullptr);
+        static std::uint64_t next_frame = 8;
+        const std::uint64_t fid = next_frame++;
+        producer.on_constants(fid, cam);
+        producer.on_tag(fid, kDepth, depth2.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW2, DH2, list.Get());
+        const auto token2 = producer.begin_present(backbuffer.Get(), list.Get());
+        list->Close();
+        queue->ExecuteCommandLists(1, lists);
+        producer.finish_present(queue.Get(), token2);
+        queue->Signal(gf.Get(), 2);
+        while (gf->GetCompletedValue() < 2) Sleep(1);
+        for (int i = 0; i < kSlots; ++i) if (sh.slots[i].state == kReady && sh.slots[i].frame_id == fid) slot = i;
+        EXPECT(sh.slots[slot].frame_id == fid && sh.slots[slot].tex[kDepth].width == DW2, "resized depth published");
+        run(true, yaw, 0, px, w, h);
+        run(false, yaw, 0, px, w, h);
+        const double xs = peak(px, w, h, true, 1);
+        run(false, 0, 0, px, w, h, side);
+        const double xts = peak(px, w, h, true, 1);
+        const HRESULT removed = renderer.device()->GetDeviceRemovedReason();
+        std::printf("depth %ux%u: yaw bar x=%.0f (expected %.0f), sideways shift %.1f px (|expected| %.1f), device %s\n", DW2, DH2, xs, x1,
+                    xts - x0, 2 * expected_side, removed == S_OK ? "ok" : "REMOVED");
+        EXPECT(removed == S_OK, "presenter device survives a depth resolution change");
+        EXPECT(std::fabs(xs - x1) < 3.0, "rotation correct after depth resolution change");
+        EXPECT(std::fabs(std::fabs(xts - x0) - 2 * expected_side) < 4.0, "parallax uses the NEW depth after a resolution change");
+    }
+
+    // Timing: GPU time of a whole presenter frame (Latewarp + blit), steady state.
+    // Every 4th frame takes in a new game frame (ingest + rendered-frame Latewarp), like 30 fps -> 120 Hz.
+    double total = 0; int samples = 0;
+    std::vector<double> cpu_ingest_tick, cpu_plain_tick, cpu_ingest, cpu_eval_rendered, cpu_eval_plain, cpu_present;
+    LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+    auto ms_since = [&](LARGE_INTEGER a) { LARGE_INTEGER b; QueryPerformanceCounter(&b); return double(b.QuadPart - a.QuadPart) * 1000.0 / double(qf.QuadPart); };
+    for (int i = 0; i < 120; ++i) {
+        const bool new_source = (i % 4) == 0;
+        LARGE_INTEGER t0, t1, t2, t3; QueryPerformanceCounter(&t0);
+        auto* l = renderer.begin_frame();
+        const CameraBasis target = apply_rotation(source, {0, 0, 1}, 0.001 * i, 0, source.pos);
+        IngestedSource steady{};
+        QueryPerformanceCounter(&t1);
+        if (new_source) steady = renderer.ingest(sh, slot);
+        if (new_source && i >= 20) cpu_ingest.push_back(ms_since(t1));
+        steady.valid = steady.has_depth = true;
+        steady.color_w = W; steady.color_h = H;
+        steady.color_rect = {0, 0, W, H}; steady.depth_rect = {0, 0, DW, DH};
+        auto inputs = renderer.latewarp_inputs(steady, true);
+        inputs.depth_inverted = true;
+        QueryPerformanceCounter(&t2);
+        latewarp.evaluate(l, inputs, new_source, view_matrix(target, {}), view_matrix(source, {}), projection);
+        if (i >= 20) (new_source ? cpu_eval_rendered : cpu_eval_plain).push_back(ms_since(t2));
+        QueryPerformanceCounter(&t3);
+        renderer.finish_frame(true, 0);
+        if (i >= 20) cpu_present.push_back(ms_since(t3));
+        if (i >= 20) (new_source ? cpu_ingest_tick : cpu_plain_tick).push_back(ms_since(t0));
+        if (i >= 10 && renderer.last_gpu_ms() > 0) { total += renderer.last_gpu_ms(); ++samples; }
+    }
+    std::printf("%ux%u presenter frame GPU time: %.3f ms average over %d frames\n", W, H, samples ? total / samples : 0.0, samples);
+    auto p50 = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v.empty() ? 0.0 : v[v.size() / 2]; };
+    auto pmax = [](const std::vector<double>& v) { return v.empty() ? 0.0 : *std::max_element(v.begin(), v.end()); };
+    std::printf("CPU ms (p50/max): ingest %.3f/%.3f, Latewarp rendered-frame %.3f/%.3f, Latewarp plain %.3f/%.3f, finish+present %.3f/%.3f\n",
+                p50(cpu_ingest), pmax(cpu_ingest), p50(cpu_eval_rendered), pmax(cpu_eval_rendered), p50(cpu_eval_plain), pmax(cpu_eval_plain),
+                p50(cpu_present), pmax(cpu_present));
+    std::printf("CPU ms per tick incl. waits (p50/max): new-frame tick %.3f/%.3f, other tick %.3f/%.3f\n", p50(cpu_ingest_tick), pmax(cpu_ingest_tick),
+                p50(cpu_plain_tick), pmax(cpu_plain_tick));
+    renderer.wait_idle();
+    latewarp.shutdown();
+    if (failures) { std::printf("%d failure(s)\n", failures); return 1; }
+    std::printf("pipeline tests passed\n");
+    return 0;
+}

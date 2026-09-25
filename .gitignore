@@ -1,0 +1,11 @@
+# Build output
+/build/
+/dist/
+/Testing/
+/.vs/
+*.user
+*.log
+
+# Fetched or supplied separately: NVIDIA DLSS SDK checkout and the Latewarp DLL
+/third_party/DLSS/
+/third_party/latewarp/

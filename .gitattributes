@@ -1,0 +1,5 @@
+* text=auto
+*.dll binary
+*.lib binary
+*.png binary
+*.ppm binary

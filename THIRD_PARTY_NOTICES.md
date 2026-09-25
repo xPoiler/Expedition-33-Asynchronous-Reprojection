@@ -1,0 +1,18 @@
+# Third-party notices
+
+FrameWarp uses the following third-party components.
+
+* **ReShade add-on API headers.** Copyright 2014 Patrick Mours. BSD 3-Clause License; see
+  `third_party/reshade/LICENSE.md` in the source repository. https://github.com/crosire/reshade
+* **Dear ImGui headers.** Copyright (c) 2014-2025 Omar Cornut. MIT License; see
+  `third_party/imgui/LICENSE.txt`. https://github.com/ocornut/imgui
+* **NVIDIA NGX SDK** (the `nvsdk_ngx_d.lib` loader, linked into `FrameWarpPresenter.exe`). Copyright (c)
+  NVIDIA Corporation, used under NVIDIA's SDK license terms. It is not part of this source repository;
+  get it from https://github.com/NVIDIA/DLSS.
+* **NVIDIA Reflex 2 Frame Warp (`nvngx_latewarp.dll`).** Copyright (c) NVIDIA Corporation. It is
+  **not included**; users supply it. FrameWarp loads it at run time through NGX.
+* **NVIDIA Streamline.** FrameWarp includes no Streamline code or binaries. It hooks the game's own
+  `sl.interposer.dll` at run time to read the data the game already provides.
+
+NVIDIA, RTX, DLSS and Reflex are trademarks of NVIDIA Corporation. FrameWarp is an independent project
+and is not affiliated with or endorsed by NVIDIA, the ReShade project, or any game developer.

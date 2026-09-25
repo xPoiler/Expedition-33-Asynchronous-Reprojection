@@ -1,0 +1,254 @@
+// FrameWarp ReShade add-on: captures Streamline camera/depth/HUD-less/UI data and the backbuffer
+// into shared slots, launches FrameWarpPresenter, and exposes settings/status in the ReShade overlay.
+#define ImTextureID ImU64
+#include <imgui.h>
+#include <reshade.hpp>
+#include "addon/producer.hpp"
+#include "addon/game_probe.hpp"
+#include "addon/streamline_hooks.hpp"
+#include <d3d12.h>
+#include <cstdio>
+#include <memory>
+#include <string>
+
+using namespace reshade::api;
+
+namespace {
+std::unique_ptr<fw::Producer> g_producer;
+HMODULE g_module = nullptr;
+bool g_presenter_launched = false;
+HANDLE g_presenter_process = nullptr;
+std::wstring g_presenter_path;
+
+std::uint32_t to_dxgi_color_space(color_space cs) {
+    switch (cs) {
+        case color_space::scrgb: return 1;       // DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+        case color_space::hdr10_pq: return 12;   // DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+        case color_space::hdr10_hlg: return 18;  // DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020
+        default: return 0;                       // DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+    }
+}
+
+void launch_presenter() {
+    if (g_presenter_launched) return;
+    g_presenter_launched = true;
+    if (GetFileAttributesW(g_presenter_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        g_producer->set_message("FrameWarp\\FrameWarpPresenter.exe not found next to the add-on");
+        return;
+    }
+    std::wstring cmd = L"\"" + g_presenter_path + L"\" --pid " + std::to_wstring(GetCurrentProcessId());
+    const std::wstring dir = g_presenter_path.substr(0, g_presenter_path.find_last_of(L"\\/"));
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi)) {
+        CloseHandle(pi.hThread);
+        g_presenter_process = pi.hProcess;
+    } else {
+        g_producer->set_message("Failed to start FrameWarpPresenter.exe");
+    }
+}
+
+bool presenter_running() {
+    return g_presenter_process && WaitForSingleObject(g_presenter_process, 0) == WAIT_TIMEOUT;
+}
+
+void on_init_swapchain(swapchain* sc, bool) {
+    device* dev = sc->get_device();
+    if (dev->get_api() != device_api::d3d12 || !g_producer) return;
+    if (!g_producer->attach(reinterpret_cast<ID3D12Device*>(dev->get_native()))) return;
+    const auto desc = dev->get_resource_desc(sc->get_current_back_buffer());
+    g_producer->set_swapchain(static_cast<HWND>(sc->get_hwnd()), desc.texture.width, desc.texture.height,
+                              static_cast<DXGI_FORMAT>(desc.texture.format), to_dxgi_color_space(sc->get_color_space()));
+    fw::install_streamline_hooks(g_producer.get());
+}
+
+// reshade_present runs after ReShade has drawn its effects and menu, so the captured frame (which
+// the presenter shows on top of the game) still contains the ReShade UI.
+void on_reshade_present(effect_runtime* runtime) {
+    command_queue* queue = runtime->get_command_queue();
+    if (!g_producer || !g_producer->ready() || !queue || queue->get_device()->get_api() != device_api::d3d12) return;
+    fw::install_streamline_hooks(g_producer.get());  // no-op once everything is hooked
+    static unsigned probe_counter = 0;
+    if ((probe_counter++ % 120) == 0) fw::probe_streamline_features();
+    auto* bb = reinterpret_cast<ID3D12Resource*>(runtime->get_current_back_buffer().handle);
+    command_list* cl = queue->get_immediate_command_list();
+    const auto token = g_producer->begin_present(bb, reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()));
+    queue->flush_immediate_command_list();
+    g_producer->finish_present(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()), token);
+    if (token && g_producer->shared()->settings.enabled && !presenter_running()) launch_presenter();
+}
+
+const char* format_name(std::uint32_t f) {
+    switch (f) {
+        case 0: return "-";
+        case DXGI_FORMAT_R32G8X24_TYPELESS: return "R32G8X24_TYPELESS";
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return "D32S8";
+        case DXGI_FORMAT_R32_TYPELESS: return "R32_TYPELESS";
+        case DXGI_FORMAT_D32_FLOAT: return "D32";
+        case DXGI_FORMAT_R24G8_TYPELESS: return "R24G8_TYPELESS";
+        case DXGI_FORMAT_R16G16_FLOAT: return "RG16F";
+        case DXGI_FORMAT_R32G32_FLOAT: return "RG32F";
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: return "RGBA16F";
+        case DXGI_FORMAT_R10G10B10A2_UNORM: return "RGB10A2";
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: return "RGB10A2_TYPELESS";
+        case DXGI_FORMAT_R8G8B8A8_UNORM: return "RGBA8";
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return "RGBA8_TYPELESS";
+        case DXGI_FORMAT_B8G8R8A8_UNORM: return "BGRA8";
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return "BGRA8_TYPELESS";
+        case DXGI_FORMAT_R11G11B10_FLOAT: return "R11G11B10F";
+        default: return nullptr;
+    }
+}
+
+void draw_overlay(effect_runtime*) {
+    if (!g_producer || !g_producer->shared()) { ImGui::TextUnformatted("Shared memory unavailable."); return; }
+    auto& sh = *g_producer->shared();
+    auto& s = sh.settings;
+    auto& h = sh.hooks;
+    auto& p = sh.presenter;
+    ImGui::TextDisabled("FrameWarp " FW_VERSION);
+
+    bool enabled = s.enabled != 0;
+    // Label follows the refresh rate the presenter measures on the overlay's display.
+    char enable_label[64] = "Enable reprojection###enable";
+    if (p.pid && p.display_hz > 1.0f)
+        std::snprintf(enable_label, sizeof(enable_label), "Enable reprojection (%.0f Hz)###enable", p.display_hz);
+    if (ImGui::Checkbox(enable_label, &enabled)) s.enabled = enabled;
+    ImGui::SameLine();
+    bool original = s.show_original != 0;
+    if (ImGui::Checkbox("Show original (A/B)", &original)) s.show_original = original;
+
+    const bool alive = presenter_running();
+    ImGui::Text("Presenter: %s", alive ? "running" : "not running");
+    if (!alive && ImGui::Button("Start presenter")) { g_presenter_launched = false; launch_presenter(); }
+    if (alive) {
+        ImGui::Text("Output %.1f fps | game %.1f fps | warp GPU %.2f ms | source age %.1f ms",
+                    p.output_fps, p.source_fps, p.warp_gpu_ms, p.source_age_ms);
+        ImGui::TextWrapped("%s", p.message);
+    }
+
+    if (ImGui::CollapsingHeader("Camera motion", ImGuiTreeNodeFlags_DefaultOpen)) {
+        bool mouse = s.use_mouse != 0;
+        if (ImGui::Checkbox("Raw mouse drives rotation", &mouse)) s.use_mouse = mouse;
+        ImGui::SliderFloat("Rotation extrapolation", &s.rotation_extrapolation, 0.0f, 1.0f);
+        static const char* const kAutoModes[] = {"Off (manual slider)", "1 game frame", "1/2 game frame", "1/4 game frame"};
+        static const std::uint32_t kAutoValues[] = {0, 1, 2, 4};
+        int auto_index = 0;
+        for (int i = 0; i < 4; ++i) if (kAutoValues[i] == s.auto_prediction) auto_index = i;
+        if (ImGui::Combo("Auto latency", &auto_index, kAutoModes, 4)) s.auto_prediction = kAutoValues[auto_index];
+        const bool auto_latency = s.auto_prediction != 0;
+        if (auto_latency) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%.1f ms (game frame %.1f ms)", p.effective_prediction_ms, p.frame_interval_ms);
+            ImGui::BeginDisabled();
+        }
+        ImGui::SliderFloat("Latency <-> smoothness (ms)", &s.prediction_ms, -40.0f, 30.0f, "%.0f");
+        if (auto_latency) ImGui::EndDisabled();
+        ImGui::TextDisabled("  negative: smoother, adds that much delay | positive: predicts further ahead");
+        ImGui::SliderFloat("Orbit distance (0 = off)", &s.orbit_distance, 0.0f, 1000.0f, "%.0f");
+        ImGui::SliderFloat("Max extrapolation (ms)", &s.max_horizon_ms, 0.0f, 200.0f, "%.0f");
+        bool strip = s.overlay_debug != 0;
+        if (ImGui::Checkbox("Debug strip (top-left, shows every presented frame)", &strip)) s.overlay_debug = strip;
+        ImGui::SliderFloat("Present lead (ms)", &s.present_lead_ms, 0.0f, 7.0f, "%.1f");
+        ImGui::TextDisabled("  render this long before the next refresh; 0 = right after the previous one");
+        static const char* const kPriorities[] = {"Realtime (default)", "High", "Normal"};
+        int priority = s.gpu_priority <= 2 ? static_cast<int>(s.gpu_priority) : 0;
+        if (ImGui::Combo("Presenter GPU priority", &priority, kPriorities, 3)) s.gpu_priority = static_cast<std::uint32_t>(priority);
+        bool invert = s.invert_warp != 0;
+        if (ImGui::Checkbox("Invert warp (debug)", &invert)) s.invert_warp = invert;
+        bool ui = s.use_ui_tags != 0;
+        if (ImGui::Checkbox("Keep HUD still (HUD-less + UI tags)", &ui)) s.use_ui_tags = ui;
+        ImGui::Separator();
+        ImGui::Text("Camera model  yaw: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
+                    p.calibrated_x ? "fitted" : "learning", p.gain_x * 1000.0f, p.tau_x_ms, p.fit_quality_x);
+        ImGui::Text("            pitch: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
+                    p.calibrated_y ? "fitted" : "learning", p.gain_y * 1000.0f, p.tau_y_ms, p.fit_quality_y);
+        ImGui::Text("Input delay %.0f ms | game latency %.1f ms | measured orbit %.0f cm", p.delay_ms, p.latency_ms, p.orbit_cm);
+        if (ImGui::Button("Reset camera model")) ++s.reset_calibration;
+        bool manual = s.manual_gain != 0;
+        if (ImGui::Checkbox("Manual mouse gain", &manual)) s.manual_gain = manual;
+        if (manual) {
+            float gx = s.manual_gain_x * 1000.0f, gy = s.manual_gain_y * 1000.0f;
+            if (ImGui::SliderFloat("Yaw mrad/count", &gx, -5.0f, 5.0f, "%.4f")) s.manual_gain_x = gx / 1000.0f;
+            if (ImGui::SliderFloat("Pitch mrad/count", &gy, -5.0f, 5.0f, "%.4f")) s.manual_gain_y = gy / 1000.0f;
+            ImGui::SliderFloat("Input delay (ms)", &s.manual_delay_ms, -20.0f, 60.0f, "%.1f");
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Streamline diagnostics")) {
+        ImGui::Text("Hooks: constants %s, tag %s, tagForFrame %s, PCL %s",
+                    (h.hooks_installed & 1) ? "yes" : "NO", (h.hooks_installed & 2) ? "yes" : "NO",
+                    (h.hooks_installed & 4) ? "yes" : "NO", (h.hooks_installed & 8) ? "yes" : "no");
+        ImGui::Text("Calls: constants %u, tag %u, tagForFrame %u, markers %u", h.constants_calls, h.tag_calls,
+                    h.tag_for_frame_calls, h.marker_calls);
+        ImGui::Text("Layout base: constants %d, tags %d (stride %u) | published %u, dropped %u, copy failures %u",
+                    h.constants_base, h.tag_base, h.pad, h.frames_published, h.slots_dropped, h.copies_failed);
+        ImGui::Text("Markers: sim %u/%u submit %u/%u present %u/%u", h.marker_counts[0], h.marker_counts[1],
+                    h.marker_counts[2], h.marker_counts[3], h.marker_counts[4], h.marker_counts[5]);
+        for (int t = 0; t < 64; ++t) {
+            if (!h.tag_count[t]) continue;
+            const char* f = format_name(h.tag_format[t]);
+            if (f) ImGui::Text("  tag type %2d: %ux%u %s (%u)", t, h.tag_width[t], h.tag_height[t], f, h.tag_count[t]);
+            else ImGui::Text("  tag type %2d: %ux%u fmt %u (%u)", t, h.tag_width[t], h.tag_height[t], h.tag_format[t], h.tag_count[t]);
+        }
+        std::string exports = "Other exports:";
+        for (int i = 0; i < fw::kCountedExportCount; ++i)
+            exports += " " + std::string(fw::kCountedExports[i] + 2) + "=" + std::to_string(h.export_calls[i]);
+        ImGui::TextWrapped("%s", exports.c_str());
+        std::string features = "slIsFeatureLoaded (id:result/loaded):";
+        for (int i = 0; i < fw::kProbedFeatureCount; ++i)
+            features += " " + std::to_string(fw::kProbedFeatures[i]) + ":" + std::to_string(h.feature_result[i]) + "/" + std::to_string(h.feature_loaded[i]);
+        ImGui::TextWrapped("%s", features.c_str());
+        ImGui::Text("Marker lookup: PCL %d, Reflex %d", h.pcl_lookup_result, h.reflex_lookup_result);
+        ImGui::TextUnformatted("UE plugin probes (calls):");
+        for (int i = 0; i < fw::kProbeCount; ++i)
+            ImGui::Text("  %-28s %s %u", fw::kProbes[i].name, (h.probe_installed & (1u << i)) ? "hooked" : "not hooked", h.probe_calls[i]);
+        if (h.message[0]) ImGui::TextWrapped("Last message: %s", h.message);
+        if (!fw::streamline_loaded()) ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "sl.interposer.dll is not loaded in this game.");
+        else if (!h.tag_calls && !h.tag_for_frame_calls)
+            ImGui::TextWrapped("No Streamline tags yet. Add r.Streamline.ForceTagging=1 under [ConsoleVariables] in Engine.ini.");
+    }
+}
+
+void register_callbacks() {
+    reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
+    reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
+    reshade::register_overlay("FrameWarp", draw_overlay);
+}
+void unregister_callbacks() {
+    reshade::unregister_overlay("FrameWarp", draw_overlay);
+    reshade::unregister_event<reshade::addon_event::reshade_present>(on_reshade_present);
+    reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
+}
+}  // namespace
+
+extern "C" {
+__declspec(dllexport) const char* NAME = "FrameWarp";
+__declspec(dllexport) const char* DESCRIPTION = "Asynchronous camera reprojection at display refresh rate with NVIDIA Latewarp, fed by Streamline data.";
+
+__declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_module) noexcept {
+    if (!reshade::register_addon(addon_module, reshade_module)) return false;
+    g_module = addon_module;
+    // Inline hooks jump into this module; keep it loaded for the life of the process even when
+    // ReShade unloads add-ons between device recreations.
+    HMODULE pinned = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                       reinterpret_cast<LPCWSTR>(&AddonInit), &pinned);
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(addon_module, path, MAX_PATH);
+    std::wstring dir = path;
+    dir = dir.substr(0, dir.find_last_of(L"\\/"));
+    g_presenter_path = dir + L"\\FrameWarp\\FrameWarpPresenter.exe";
+    if (!g_producer) g_producer = std::make_unique<fw::Producer>();
+    fw::install_streamline_hooks(g_producer.get());
+    fw::install_game_probes(g_producer->shared() ? &g_producer->shared()->hooks : nullptr);
+    register_callbacks();
+    return true;
+}
+
+__declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE reshade_module) noexcept {
+    unregister_callbacks();
+    // The producer (and hooks) stay alive: the module is pinned and hooks may still fire.
+    reshade::unregister_addon(addon_module, reshade_module);
+}
+}

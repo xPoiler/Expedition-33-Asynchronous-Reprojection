@@ -1,0 +1,523 @@
+#include "presenter/renderer.hpp"
+#include <d3dcompiler.h>
+#include <cstdio>
+#include <algorithm>
+#include <cstring>
+#include <vector>
+
+namespace fw {
+namespace {
+
+const char kShaders[] = R"(
+Texture2D<float4> src : register(t0);
+RWTexture2D<float4> dst4 : register(u0);
+RWTexture2D<float> dst1 : register(u0);
+cbuffer C : register(b0) { uint2 size; uint marker; uint counter; };
+
+[numthreads(8, 8, 1)] void cs_color(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= size)) return;
+    dst4[id.xy] = src.Load(int3(id.xy, 0));
+}
+[numthreads(8, 8, 1)] void cs_depth(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= size)) return;
+    dst1[id.xy] = src.Load(int3(id.xy, 0)).x;
+}
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 ps(float4 pos : SV_Position) : SV_Target {
+    int2 p = int2(pos.xy);
+    float4 c = src.Load(int3(p, 0));
+    // Debug strip (top-left, 16 cells of 48x48 px): one white cell advances every presented frame,
+    // the rest is green while warping / red while showing the original. Only exists in our output.
+    if (marker != 0 && p.y < 48 && p.x < 48 * 16) {
+        const uint cell = uint(p.x) / 48;
+        c = cell == (counter % 16) ? float4(1, 1, 1, 1) : (marker == 1 ? float4(0, 0.6, 0, 1) : float4(0.6, 0, 0, 1));
+    }
+    return float4(c.rgb, 1);
+}
+)";
+
+// Descriptor layout in the shader-visible heap.
+constexpr UINT kSrcSrv = 0;         // + slot * kTexCount + kind: shared textures
+constexpr UINT kPrivUav = 32;       // + private id
+constexpr UINT kPrivSrv = 48;       // + private id
+constexpr UINT kHeapSize = 64;
+
+DXGI_FORMAT srv_format(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_UNORM;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+        default: return f;
+    }
+}
+
+DXGI_FORMAT swapchain_format(DXGI_FORMAT game) {
+    switch (srv_format(game)) {
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case DXGI_FORMAT_R10G10B10A2_UNORM: return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        default: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
+ComPtr<ID3DBlob> compile(const char* entry, const char* target, std::string& error) {
+    ComPtr<ID3DBlob> code, messages;
+    if (FAILED(D3DCompile(kShaders, sizeof(kShaders) - 1, "framewarp.hlsl", nullptr, nullptr, entry, target,
+                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &messages))) {
+        error = std::string("shader ") + entry + ": " + (messages ? static_cast<const char*>(messages->GetBufferPointer()) : "?");
+        return nullptr;
+    }
+    return code;
+}
+
+D3D12_RESOURCE_BARRIER transition_barrier(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to};
+    return b;
+}
+
+}  // namespace
+
+Renderer::~Renderer() {
+    if (queue_ && fence_) wait_idle();
+    if (fence_event_) CloseHandle(fence_event_);
+    if (waitable_) CloseHandle(waitable_);
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE Renderer::cpu(UINT index) const {
+    auto h = heap_->GetCPUDescriptorHandleForHeapStart(); h.ptr += SIZE_T(index) * descriptor_size_; return h;
+}
+D3D12_GPU_DESCRIPTOR_HANDLE Renderer::gpu(UINT index) const {
+    auto h = heap_->GetGPUDescriptorHandleForHeapStart(); h.ptr += UINT64(index) * descriptor_size_; return h;
+}
+
+bool Renderer::init(const LUID& adapter_luid, HWND window, std::uint32_t width, std::uint32_t height, DXGI_FORMAT game_format,
+                    std::uint32_t color_space, std::string& error) {
+    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_)))) { error = "DXGI factory"; return false; }
+    ComPtr<IDXGIAdapter1> adapter;
+    if (FAILED(factory_->EnumAdapterByLuid(adapter_luid, IID_PPV_ARGS(&adapter)))) { error = "game adapter not found"; return false; }
+    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device_)))) { error = "D3D12 device"; return false; }
+
+    // Highest queue priority we are allowed: realtime needs SeIncreaseBasePriorityPrivilege (admin).
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME; priority_name_ = "realtime";
+    if (FAILED(device_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_)))) {
+        qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH; priority_name_ = "high";
+        if (FAILED(device_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_)))) { error = "command queue"; return false; }
+    }
+    for (auto& a : allocators_)
+        if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)))) { error = "allocator"; return false; }
+    if (FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators_[0].Get(), nullptr, IID_PPV_ARGS(&list_)))) { error = "command list"; return false; }
+    list_->Close();
+    if (FAILED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)))) { error = "fence"; return false; }
+    fence_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)))) { error = "descriptor heap"; return false; }
+    D3D12_DESCRIPTOR_HEAP_DESC rd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    if (FAILED(device_->CreateDescriptorHeap(&rd, IID_PPV_ARGS(&rtv_heap_)))) { error = "rtv heap"; return false; }
+    descriptor_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    rtv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    swap_format_ = swapchain_format(game_format);
+    if (!create_pipelines(error)) return false;
+
+    D3D12_QUERY_HEAP_DESC qh{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 6, 0};
+    device_->CreateQueryHeap(&qh, IID_PPV_ARGS(&timestamps_));
+    D3D12_HEAP_PROPERTIES rb{}; rb.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = 6 * 8; bd.Height = 1;
+    bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback_));
+    queue_->GetTimestampFrequency(&timestamp_frequency_);
+    queue_->GetClockCalibration(&calib_gpu_, &calib_cpu_);
+
+    // Composition swapchain: DWM composites it over the game without taking focus or input.
+    width_ = width; height_ = height;
+    DXGI_SWAP_CHAIN_DESC1 sd{};
+    sd.Width = width; sd.Height = height; sd.Format = swap_format_; sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.BufferCount = 3;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD; sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE; sd.Scaling = DXGI_SCALING_STRETCH;
+    sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    ComPtr<IDXGISwapChain1> sc1;
+    if (FAILED(factory_->CreateSwapChainForComposition(queue_.Get(), &sd, nullptr, &sc1)) || FAILED(sc1.As(&swapchain_))) {
+        error = "composition swapchain"; return false;
+    }
+    swapchain_->SetMaximumFrameLatency(1);
+    waitable_ = swapchain_->GetFrameLatencyWaitableObject();
+    UINT support = 0;
+    const auto cs = static_cast<DXGI_COLOR_SPACE_TYPE>(color_space);
+    if (SUCCEEDED(swapchain_->CheckColorSpaceSupport(cs, &support)) && (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
+        swapchain_->SetColorSpace1(cs);
+    if (FAILED(DCompositionCreateDevice(nullptr, IID_PPV_ARGS(&dcomp_))) ||
+        FAILED(dcomp_->CreateTargetForHwnd(window, TRUE, &target_)) || FAILED(dcomp_->CreateVisual(&visual_)) ||
+        FAILED(visual_->SetContent(swapchain_.Get())) || FAILED(target_->SetRoot(visual_.Get())) || FAILED(dcomp_->Commit())) {
+        error = "DirectComposition setup"; return false;
+    }
+    create_swapchain_views();
+    return true;
+}
+
+void Renderer::create_swapchain_views() {
+    for (UINT i = 0; i < 3; ++i) {
+        ComPtr<ID3D12Resource> buffer;
+        swapchain_->GetBuffer(i, IID_PPV_ARGS(&buffer));
+        auto h = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); h.ptr += SIZE_T(i) * rtv_size_;
+        device_->CreateRenderTargetView(buffer.Get(), nullptr, h);
+    }
+}
+
+bool Renderer::resize(std::uint32_t width, std::uint32_t height) {
+    if (width == width_ && height == height_) return true;
+    wait_idle();
+    if (FAILED(swapchain_->ResizeBuffers(3, width, height, swap_format_, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))) return false;
+    width_ = width; height_ = height;
+    create_swapchain_views();
+    return true;
+}
+
+bool Renderer::create_pipelines(std::string& error) {
+    D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    D3D12_DESCRIPTOR_RANGE uav{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER params[3]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {0, 0, 4};
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable = {1, &srv};
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[2].DescriptorTable = {1, &uav};
+    D3D12_ROOT_SIGNATURE_DESC rs{3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> blob, err;
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)) ||
+        FAILED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root_)))) {
+        error = "root signature"; return false;
+    }
+    auto color = compile("cs_color", "cs_5_0", error), depth = compile("cs_depth", "cs_5_0", error);
+    auto vs = compile("vs", "vs_5_0", error), ps = compile("ps", "ps_5_0", error);
+    if (!color || !depth || !vs || !ps) return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
+    cd.pRootSignature = root_.Get();
+    cd.CS = {color->GetBufferPointer(), color->GetBufferSize()};
+    if (FAILED(device_->CreateComputePipelineState(&cd, IID_PPV_ARGS(&cs_color_)))) { error = "cs_color pso"; return false; }
+    cd.CS = {depth->GetBufferPointer(), depth->GetBufferSize()};
+    if (FAILED(device_->CreateComputePipelineState(&cd, IID_PPV_ARGS(&cs_depth_)))) { error = "cs_depth pso"; return false; }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC gd{};
+    gd.pRootSignature = root_.Get();
+    gd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    gd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    gd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    gd.SampleMask = UINT_MAX;
+    gd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; gd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    gd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    gd.NumRenderTargets = 1; gd.RTVFormats[0] = swap_format_;
+    gd.SampleDesc.Count = 1;
+    if (FAILED(device_->CreateGraphicsPipelineState(&gd, IID_PPV_ARGS(&blit_)))) { error = "blit pso"; return false; }
+    return true;
+}
+
+bool Renderer::ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format) {
+    auto& p = private_[id];
+    if (p.texture && p.width == w && p.height == h && p.format == format) return true;
+    if (p.texture) wait_idle();
+    p = Private{};
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; d.Width = w; d.Height = h; d.DepthOrArraySize = 1; d.MipLevels = 1;
+    d.Format = format; d.SampleDesc.Count = 1; d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                nullptr, IID_PPV_ARGS(&p.texture)))) return false;
+    p.width = w; p.height = h; p.format = format; p.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    device_->CreateUnorderedAccessView(p.texture.Get(), nullptr, nullptr, cpu(kPrivUav + id));
+    device_->CreateShaderResourceView(p.texture.Get(), nullptr, cpu(kPrivSrv + id));
+    return true;
+}
+
+void Renderer::transition(Private& p, D3D12_RESOURCE_STATES to) {
+    if (p.state == to) return;
+    const auto b = transition_barrier(p.texture.Get(), p.state, to);
+    list_->ResourceBarrier(1, &b);
+    p.state = to;
+}
+
+bool Renderer::open_session(DWORD pid, std::uint64_t session, std::string& error) {
+    wait_idle();
+    fence_game_.Reset();
+    for (auto& slot : shared_) for (auto& t : slot) t = SharedTex{};
+    std::fill(std::begin(srv_resource_), std::end(srv_resource_), nullptr);
+    pid_ = pid; session_ = session;
+    HANDLE handle = nullptr;
+    if (FAILED(device_->OpenSharedHandleByName(object_name(pid, session, L"fence").c_str(), GENERIC_ALL, &handle))) {
+        error = "game fence not available yet"; return false;
+    }
+    const HRESULT hr = device_->OpenSharedHandle(handle, IID_PPV_ARGS(&fence_game_));
+    CloseHandle(handle);
+    if (FAILED(hr)) { error = "open game fence"; return false; }
+    return true;
+}
+
+ID3D12Resource* Renderer::shared_texture(int slot, int kind, std::uint32_t generation) {
+    auto& t = shared_[slot][kind];
+    if (t.resource && t.generation == generation) return t.resource.Get();
+    if (t.resource) {
+        // The game resized this texture (e.g. DLSS preset change). Frames in flight may still read the old
+        // one, and the replacement can be allocated at the same address, so a pointer-keyed descriptor
+        // cache would keep describing freed memory (GPU page fault -> DEVICE_HUNG). Drain, then forget it.
+        wait_idle();
+        srv_resource_[kSrcSrv + slot * kTexCount + kind] = nullptr;
+    }
+    t = SharedTex{};
+    HANDLE handle = nullptr;
+    if (FAILED(device_->OpenSharedHandleByName(object_name(pid_, session_, L"tex", slot, kind, generation).c_str(), GENERIC_ALL, &handle)))
+        return nullptr;
+    const HRESULT hr = device_->OpenSharedHandle(handle, IID_PPV_ARGS(&t.resource));
+    CloseHandle(handle);
+    if (FAILED(hr)) return nullptr;
+    t.generation = generation;
+    {
+        const auto d = t.resource->GetDesc();
+        char note[160];
+        std::snprintf(note, sizeof(note), "opened shared %s slot %d gen %u: %llux%u fmt %d", tex_name(kind), slot, generation,
+                      static_cast<unsigned long long>(d.Width), d.Height, int(d.Format));
+        notes_.push_back(note);
+    }
+    return t.resource.Get();
+}
+
+ID3D12GraphicsCommandList* Renderer::begin_frame() {
+    frame_index_ = (frame_index_ + 1) % 3;
+    if (!completed(frame_values_[frame_index_])) {
+        fence_->SetEventOnCompletion(frame_values_[frame_index_], fence_event_);
+        WaitForSingleObject(fence_event_, 1000);
+    }
+    // GPU time of the frame that last used this allocator.
+    if (readback_ && frame_values_[frame_index_]) {
+        std::uint64_t* ts = nullptr;
+        D3D12_RANGE range{frame_index_ * 16, frame_index_ * 16 + 16};
+        if (SUCCEEDED(readback_->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
+            const auto a = ts[frame_index_ * 2], b = ts[frame_index_ * 2 + 1];
+            if (b > a) gpu_ms_ = static_cast<float>(double(b - a) * 1000.0 / double(timestamp_frequency_));
+            // Convert GPU timestamps to CPU QPC with the calibration pair.
+            LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+            auto to_qpc = [&](std::uint64_t gpu) {
+                const double seconds = (double(gpu) - double(calib_gpu_)) / double(timestamp_frequency_);
+                return static_cast<std::int64_t>(double(calib_cpu_) + seconds * double(qf.QuadPart));
+            };
+            if (b > a && a > 0) { timing_ = {submit_qpc_[frame_index_], to_qpc(a), to_qpc(b), true}; }
+            D3D12_RANGE none{0, 0};
+            readback_->Unmap(0, &none);
+        }
+    }
+    allocators_[frame_index_]->Reset();
+    list_->Reset(allocators_[frame_index_].Get(), nullptr);
+    if (timestamps_) list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2);
+    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
+    list_->SetDescriptorHeaps(1, heaps);
+    reading_.clear();
+    return list_.Get();
+}
+
+void Renderer::convert(ID3D12Resource* source, DXGI_FORMAT source_format, int slot, int kind, PrivateId target,
+                       std::uint32_t w, std::uint32_t h) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = srv_format(source_format);
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    const UINT index = kSrcSrv + slot * kTexCount + kind;
+    if (srv_resource_[index] != source) {
+        // A frame still in flight may read this descriptor: only rewrite it once the GPU is idle.
+        if (srv_resource_[index]) wait_idle();
+        device_->CreateShaderResourceView(source, &sv, cpu(index));
+        srv_resource_[index] = source;
+    }
+    auto& p = private_[target];
+    transition(p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list_->SetPipelineState(target == kPDepth ? cs_depth_.Get() : cs_color_.Get());
+    list_->SetComputeRootSignature(root_.Get());
+    const std::uint32_t constants[4] = {w, h, 0, 0};
+    list_->SetComputeRoot32BitConstants(0, 4, constants, 0);
+    list_->SetComputeRootDescriptorTable(1, gpu(index));
+    list_->SetComputeRootDescriptorTable(2, gpu(kPrivUav + target));
+    list_->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    transition(p, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+}
+
+IngestedSource Renderer::ingest(const Shared& shared, int slot) {
+    IngestedSource out;
+    const auto& m = shared.slots[slot];
+    const auto& bb = m.tex[kBackbuffer];
+    if (!bb.valid || !fence_game_) return out;
+    ID3D12Resource* sources[kTexCount]{};
+    for (int k = 0; k < kTexCount; ++k)
+        if (m.tex[k].valid) sources[k] = shared_texture(slot, k, m.tex[k].generation);
+    if (!sources[kBackbuffer]) return out;
+    pending_game_wait_ = std::max(pending_game_wait_, m.fence_value);
+
+    // Shared textures live in COMMON between the two devices' queues.
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    for (auto* r : sources)
+        if (r) { barriers.push_back(transition_barrier(r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)); reading_.push_back(r); }
+    list_->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+
+    out.color_w = bb.width; out.color_h = bb.height;
+    out.color_rect = {0, 0, bb.width, bb.height};
+    ensure_private(kPBackbuffer, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ensure_private(kPHudless, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ensure_private(kPUi, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ensure_private(kPZeroUi, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ensure_private(kPOutput, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    convert(sources[kBackbuffer], static_cast<DXGI_FORMAT>(bb.format), slot, kBackbuffer, kPBackbuffer, bb.width, bb.height);
+
+    const auto& hl = m.tex[kHudless];
+    if (sources[kHudless] && hl.width == bb.width && hl.height == bb.height) {
+        convert(sources[kHudless], static_cast<DXGI_FORMAT>(hl.format), slot, kHudless, kPHudless, bb.width, bb.height);
+        out.has_hudless = true;
+    }
+    const auto& ui = m.tex[kUi];
+    if (sources[kUi] && ui.width == bb.width && ui.height == bb.height) {
+        convert(sources[kUi], static_cast<DXGI_FORMAT>(ui.format), slot, kUi, kPUi, bb.width, bb.height);
+        out.has_ui = true;
+    }
+    const auto& dp = m.tex[kDepth];
+    if (sources[kDepth]) {
+        ensure_private(kPDepth, dp.width, dp.height, DXGI_FORMAT_R32_FLOAT);
+        ensure_private(kPMotion, dp.width, dp.height, DXGI_FORMAT_R16G16_FLOAT);
+        convert(sources[kDepth], static_cast<DXGI_FORMAT>(dp.format), slot, kDepth, kPDepth, dp.width, dp.height);
+        out.depth_rect = {dp.ext_x, dp.ext_y, dp.ext_w, dp.ext_h};
+        out.has_depth = true;
+    }
+    barriers.clear();
+    for (auto* r : reading_) barriers.push_back(transition_barrier(r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
+    list_->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    reading_.clear();
+    out.valid = true;
+    return out;
+}
+
+LatewarpInputs Renderer::latewarp_inputs(const IngestedSource& src, bool use_ui_tags) {
+    LatewarpInputs in;
+    const bool split = use_ui_tags && src.has_hudless && src.has_ui;
+    in.backbuffer = private_[kPBackbuffer].texture.Get();
+    in.hudless = split ? private_[kPHudless].texture.Get() : in.backbuffer;
+    in.ui = split ? private_[kPUi].texture.Get() : private_[kPZeroUi].texture.Get();
+    in.depth = private_[kPDepth].texture.Get();
+    in.motion = private_[kPMotion].texture.Get();
+    in.output = private_[kPOutput].texture.Get();
+    in.color_rect = src.color_rect;
+    in.depth_rect = src.depth_rect;
+    if (in.output) transition(private_[kPOutput], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    return in;
+}
+
+void Renderer::finish_frame(bool warped, int marker) {
+    ComPtr<ID3D12Resource> back;
+    const UINT index = swapchain_->GetCurrentBackBufferIndex();
+    swapchain_->GetBuffer(index, IID_PPV_ARGS(&back));
+    const auto to_rt = transition_barrier(back.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    list_->ResourceBarrier(1, &to_rt);
+    auto rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += SIZE_T(index) * rtv_size_;
+    const PrivateId source = warped ? kPOutput : kPBackbuffer;
+    if (private_[source].texture) {
+        transition(private_[source], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
+        list_->SetDescriptorHeaps(1, heaps);  // NGX may have bound its own heap
+        list_->SetPipelineState(blit_.Get());
+        list_->SetGraphicsRootSignature(root_.Get());
+        const std::uint32_t constants[4] = {width_, height_, static_cast<std::uint32_t>(marker), static_cast<std::uint32_t>(present_counter_++)};
+        list_->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
+        list_->SetGraphicsRootDescriptorTable(1, gpu(kPrivSrv + source));
+        const D3D12_VIEWPORT vp{0, 0, float(width_), float(height_), 0, 1};
+        const D3D12_RECT sr{0, 0, LONG(width_), LONG(height_)};
+        list_->RSSetViewports(1, &vp);
+        list_->RSSetScissorRects(1, &sr);
+        list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list_->DrawInstanced(3, 1, 0, 0);
+        transition(private_[source], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    } else {
+        const float black[4] = {0, 0, 0, 1};
+        list_->ClearRenderTargetView(rtv, black, 0, nullptr);
+    }
+    const auto to_present = transition_barrier(back.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    list_->ResourceBarrier(1, &to_present);
+    if (timestamps_) {
+        list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2 + 1);
+        list_->ResolveQueryData(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2, 2, readback_.Get(), frame_index_ * 16);
+    }
+    list_->Close();
+    if (pending_game_wait_ && fence_game_) { queue_->Wait(fence_game_.Get(), pending_game_wait_); pending_game_wait_ = 0; }
+    ID3D12CommandList* lists[] = {list_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    {
+        LARGE_INTEGER q; QueryPerformanceCounter(&q);
+        submit_qpc_[frame_index_] = q.QuadPart;
+    }
+    swapchain_->Present(1, 0);
+    {
+        DXGI_FRAME_STATISTICS st{};
+        present_stats_.hr = swapchain_->GetFrameStatistics(&st);
+        swapchain_->GetLastPresentCount(&present_stats_.last_present_count);
+        present_stats_.present_count = st.PresentCount; present_stats_.present_refresh = st.PresentRefreshCount;
+        present_stats_.sync_refresh = st.SyncRefreshCount; present_stats_.sync_qpc = st.SyncQPCTime.QuadPart;
+        static int recalibrate = 0;
+        if (++recalibrate % 240 == 0) queue_->GetClockCalibration(&calib_gpu_, &calib_cpu_);
+    }
+    queue_->Signal(fence_.Get(), ++fence_value_);
+    frame_values_[frame_index_] = fence_value_;
+}
+
+bool Renderer::read_back(bool output, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
+    auto& p = private_[output ? kPOutput : kPBackbuffer];
+    if (!p.texture) return false;
+    wait_idle();
+    const auto desc = p.texture->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT64 total = 0;
+    device_->GetCopyableFootprints(&desc, 0, 1, 0, &fp, nullptr, nullptr, &total);
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1;
+    bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> buffer;
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) return false;
+    allocators_[frame_index_]->Reset();
+    list_->Reset(allocators_[frame_index_].Get(), nullptr);
+    const auto before = p.state;
+    transition(p, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst{buffer.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+    dst.PlacedFootprint = fp;
+    D3D12_TEXTURE_COPY_LOCATION src{p.texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+    list_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    transition(p, before);
+    list_->Close();
+    ID3D12CommandList* lists[] = {list_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    wait_idle();
+    w = static_cast<std::uint32_t>(desc.Width); h = desc.Height;
+    pixels.resize(std::size_t(w) * h * 4);
+    std::uint8_t* mapped = nullptr;
+    if (FAILED(buffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) return false;
+    for (std::uint32_t y = 0; y < h; ++y)
+        std::memcpy(&pixels[std::size_t(y) * w * 4], mapped + fp.Offset + std::size_t(y) * fp.Footprint.RowPitch, std::size_t(w) * 8);
+    buffer->Unmap(0, nullptr);
+    return true;
+}
+
+void Renderer::wait_idle() {
+    if (!queue_ || !fence_) return;
+    queue_->Signal(fence_.Get(), ++fence_value_);
+    if (fence_->GetCompletedValue() < fence_value_) {
+        fence_->SetEventOnCompletion(fence_value_, fence_event_);
+        WaitForSingleObject(fence_event_, 2000);
+    }
+}
+
+}  // namespace fw

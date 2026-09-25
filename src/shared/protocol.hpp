@@ -1,0 +1,160 @@
+#pragma once
+// Shared-memory contract between the in-game add-on (producer) and FrameWarpPresenter (consumer).
+// Everything here is plain data: both sides are x64 MSVC builds of this same header.
+#include <windows.h>
+#include <cstdint>
+#include <string>
+
+namespace fw {
+
+inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
+
+constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
+constexpr std::uint32_t kVersion = 16;
+constexpr int kSlots = 4;
+
+// Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
+enum Tex : int { kBackbuffer = 0, kHudless, kUi, kDepth, kMotion, kTexCount };
+inline const char* tex_name(int t) {
+    static const char* n[] = {"backbuffer", "hudless", "ui", "depth", "motion"};
+    return t >= 0 && t < kTexCount ? n[t] : "?";
+}
+
+// Slot lifecycle: Free -> Writing (game) -> Ready (game signalled fence) -> Reading (presenter) -> Free.
+enum SlotState : LONG { kFree = 0, kWriting = 1, kReady = 2, kReading = 3 };
+
+struct TexInfo {
+    std::uint32_t width, height, format;  // DXGI_FORMAT of the shared copy (== source format)
+    std::uint32_t generation;             // bumps when the shared texture is recreated
+    std::uint32_t ext_x, ext_y, ext_w, ext_h;  // valid region inside the texture
+    std::uint32_t valid;                  // written for this slot's frame
+    std::uint32_t pad;
+};
+
+// Camera for one rendered frame, taken verbatim from sl::Constants (row-major, row-vector, UE view space:
+// x right, y up, z forward). Positions/directions are in game world space.
+struct Camera {
+    float view_to_clip[16];
+    float clip_to_view[16];
+    float clip_to_prev_clip[16];  // the game's own reprojection to the previous frame
+    float pos[3], up[3], right[3], fwd[3];
+    float near_plane, far_plane, fov, aspect;
+    float jitter[2], mvec_scale[2];
+    std::uint32_t depth_inverted, reset, valid, position_epoch;  // epoch changes when pos is discontinuous
+};
+
+struct SlotMeta {
+    volatile LONG state;
+    std::uint32_t pad0;
+    std::uint64_t frame_id;     // Streamline frame token
+    std::uint64_t fence_value;  // game-side shared fence value that completes this slot's copies
+    std::int64_t qpc_sim_start;  // PCL simulation-start marker for frame_id (0 if unknown)
+    std::int64_t qpc_constants;  // when slSetConstants arrived for frame_id
+    std::int64_t qpc_present;    // when the game presented frame_id
+    Camera camera;
+    TexInfo tex[kTexCount];
+};
+
+// Settings are written by the add-on UI and read by the presenter.
+struct Settings {
+    std::uint32_t enabled;         // presenter shows warped frames
+    std::uint32_t show_original;   // A/B: present latest game frame without warp
+    std::uint32_t use_mouse;       // raw mouse drives rotation
+    std::uint32_t use_ui_tags;     // pass HUD-less + UI to Latewarp (HUD stays still)
+    float rotation_extrapolation;  // 0..1, non-mouse (residual) angular velocity extrapolation
+    float translation_extrapolation;  // 0..1
+    float orbit_distance;          // world units in front of the camera to orbit around (0 = first person)
+    float max_horizon_ms;          // clamp for extrapolation
+    std::uint32_t reset_calibration;  // incremented by UI
+    std::uint32_t manual_gain;     // 1: use manual gains below instead of learned
+    float manual_gain_x, manual_gain_y;  // radians per count
+    float manual_delay_ms;
+    std::uint32_t overlay_debug;   // presenter draws a debug indicator
+    std::uint32_t invert_warp;     // debug: flip the applied rotation
+    float prediction_ms;           // show the camera this far ahead of the game's own latency
+    std::uint32_t auto_prediction; // 0: manual slider; 1, 2, 4: -(1/n of the measured game frame)
+    float present_lead_ms;         // render this long before the next vblank (0: right after the previous one)
+    std::uint32_t gpu_priority;    // presenter GPU scheduling class: 0 realtime (default), 1 high, 2 normal
+    std::uint32_t pad[2];
+};
+
+// Presenter status, displayed by the add-on UI.
+struct PresenterStatus {
+    volatile LONG pid;
+    std::uint32_t pad0;
+    std::int64_t heartbeat_qpc;
+    float output_fps, source_fps, warp_gpu_ms, source_age_ms;
+    float gain_x, gain_y, delay_ms, fit_quality_x, fit_quality_y;
+    std::uint32_t calibrated_x, calibrated_y;
+    std::uint32_t frames_presented, frames_warped, sources_consumed, pad1;
+    float tau_x_ms, tau_y_ms, latency_ms, orbit_cm;
+    float frame_interval_ms, effective_prediction_ms;
+    float display_hz;  // measured refresh rate of the display the overlay is on (0 = not measured yet)
+    float pad3;
+    char message[256];
+};
+
+struct HookStats {
+    std::uint32_t constants_calls, tag_calls, tag_for_frame_calls, marker_calls;
+    std::int32_t constants_base, tag_base;  // detected BaseStructure size (-1 unknown)
+    std::uint32_t hooks_installed;          // bitmask
+    std::uint32_t pcl_hooked;
+    std::uint32_t marker_counts[16];
+    // One entry per Streamline BufferType value seen (first 32): format and size of the last tag.
+    std::uint32_t tag_format[64], tag_width[64], tag_height[64], tag_count[64];
+    std::uint32_t copies_failed, slots_dropped, frames_published, pad;  // pad = detected ResourceTag stride
+    char message[256];
+    // Broad Streamline activity diagnostics.
+    std::uint32_t export_calls[16];      // per entry of kCountedExports (see streamline_hooks.cpp)
+    std::int32_t feature_result[12];     // slIsFeatureLoaded result code per probed feature (-1 = not probed)
+    std::uint32_t feature_loaded[12];
+    std::int32_t pcl_lookup_result, reflex_lookup_result;
+    std::uint32_t probe_calls[8];  // game-specific plugin probes (game_probe.cpp)
+    std::uint32_t probe_installed;
+};
+
+// Game-side event log (lock-free ring) written by the add-on, dumped to CSV by the presenter.
+enum EventKind : std::uint32_t { kEvConstants = 1, kEvTag = 2, kEvSimStart = 3, kEvPresentMarker = 4, kEvPresent = 5, kEvPublished = 6 };
+struct TimelineEvent {
+    std::int64_t qpc;
+    std::uint32_t kind, tid;
+    std::uint64_t frame, extra;
+};
+constexpr int kTimeline = 4096;
+
+struct Shared {
+    std::uint32_t magic, version;
+    std::uint32_t producer_pid, pad0;
+    std::uint64_t session;  // unique per producer instance; part of every object name
+    LUID adapter;
+    std::uint64_t game_hwnd;
+    std::uint32_t backbuffer_format, color_space;  // DXGI_FORMAT / DXGI_COLOR_SPACE_TYPE
+    std::uint32_t backbuffer_width, backbuffer_height;
+    volatile LONG64 latest_ready_frame;
+    std::int64_t qpc_frequency;
+    SlotMeta slots[kSlots];
+    Settings settings;
+    PresenterStatus presenter;
+    HookStats hooks;
+    volatile LONG64 timeline_count;
+    TimelineEvent timeline[kTimeline];
+};
+
+inline void push_event(Shared* s, EventKind kind, std::uint64_t frame, std::uint64_t extra = 0) {
+    if (!s) return;
+    const LONG64 index = InterlockedIncrement64(&s->timeline_count) - 1;
+    auto& e = s->timeline[index % kTimeline];
+    e.qpc = qpc_now(); e.kind = kind; e.tid = GetCurrentThreadId(); e.frame = frame; e.extra = extra;
+}
+
+inline std::wstring map_name(DWORD pid) { return L"Local\\FrameWarp_" + std::to_wstring(pid); }
+inline std::wstring object_name(DWORD pid, std::uint64_t session, const wchar_t* what, int slot = -1, int tex = -1,
+                                std::uint32_t generation = 0) {
+    std::wstring s = L"Local\\FrameWarp_" + std::to_wstring(pid) + L"_" + std::to_wstring(session) + L"_" + what;
+    if (slot >= 0) s += L"_s" + std::to_wstring(slot);
+    if (tex >= 0) s += L"_t" + std::to_wstring(tex) + L"_g" + std::to_wstring(generation);
+    return s;
+}
+
+
+}  // namespace fw

@@ -1,0 +1,48 @@
+#include "shared/camera_motion.hpp"
+#include <cstdio>
+
+using namespace fw;
+static int failures = 0;
+#define EXPECT(cond, ...) do { if (!(cond)) { ++failures; std::printf("FAIL %s:%d: ", __FILE__, __LINE__); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
+
+static M4 mm(const M4& a, const M4& b) {
+    M4 r{};
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) r[i][j] += a[i][k] * b[k][j];
+    return r;
+}
+
+static void recovers(double yaw, double pitch, V3 t, double near_plane) {
+    // E33-like reversed-Z infinite projection with TAA jitter (row-vector).
+    const float P[16] = {1.1667f, 0, 0, 0, 0, 2.0741f, 0, 0, 0.00039f, 0.00108f, 0, 1, 0, 0, float(near_plane), 0};
+    // Column-form rotation R = Ry(yaw) * Rx(pitch) mapping current view -> previous view.
+    const double cy = std::cos(yaw), sy = std::sin(yaw), cp = std::cos(pitch), sp = std::sin(pitch);
+    const R3 Ry{{{cy, 0, sy}, {0, 1, 0}, {-sy, 0, cy}}}, Rx{{{1, 0, 0}, {0, cp, -sp}, {0, sp, cp}}};
+    R3 R{};
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) for (int k = 0; k < 3; ++k) R[i][j] += Ry[i][k] * Rx[k][j];
+    M4 Mrow{};  // row-vector: v_prev = v_cur * Mrow  (upper 3x3 = R^T, last row = t)
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) Mrow[i][j] = R[j][i];
+    for (int j = 0; j < 3; ++j) Mrow[3][j] = t[j];
+    Mrow[3][3] = 1;
+    const M4 Pm = m4_from(P);
+    M4 Pinv; invert(Pm, Pinv);
+    const M4 C = mm(mm(Pinv, Mrow), Pm);
+    float Cf[16];
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) Cf[i * 4 + j] = float(C[i][j]);
+    const FrameMotion m = recover_motion(P, Cf);
+    EXPECT(m.valid, "valid");
+    double rerr = 0, terr = 0;
+    for (int i = 0; i < 3; ++i) { for (int j = 0; j < 3; ++j) rerr = std::max(rerr, std::fabs(m.rotation[i][j] - R[i][j])); terr = std::max(terr, std::fabs(m.translation[i] - t[i])); }
+    EXPECT(rerr < 1e-4, "rotation error %g (yaw %g pitch %g)", rerr, yaw, pitch);
+    EXPECT(terr < 0.05 + 0.002 * std::sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]), "translation error %g (t %g %g %g)", terr, t[0], t[1], t[2]);
+}
+
+int main() {
+    recovers(0, 0, {0, 0, 0}, 1.0);
+    recovers(0.02, -0.01, {0, 0, 0}, 1.0);
+    recovers(0.03, 0.015, {5.0, -2.0, 1.5}, 1.0);     // orbit-like step (cm)
+    recovers(-0.05, 0.02, {-20.0, 3.0, -8.0}, 10.0);  // other near plane
+    recovers(0.001, 0.0, {0.0, 0.0, 12.0}, 1.0);      // walking forward
+    if (failures) { std::printf("%d failure(s)\n", failures); return 1; }
+    std::printf("motion tests passed\n");
+    return 0;
+}

@@ -1,0 +1,97 @@
+# Architecture
+
+```
+ GAME PROCESS                                               PRESENTER PROCESS (FrameWarpPresenter.exe)
+ ReShade + FrameWarp.addon64                                 own D3D12 device on the same GPU
+ ─────────────────────────────────                           ───────────────────────────────────────────
+ inline hooks in sl.interposer.dll                           main thread: overlay window, raw mouse
+   slSetConstants ─► camera (+ integrated position)            (RIDEV_INPUTSINK), window tracking
+   slSetTag/ForFrame ─► GPU copy of depth / MV /             render thread (TIME_CRITICAL), per vblank:
+                        HUD-less / UI into slot textures        1. newest slot whose game fence completed
+ PCL marker hook ─► sim-start time, present frame id            2. convert shared → private textures
+ reshade_present ─► GPU copy of backbuffer (incl. ReShade UI)   3. PoseModel.predict(now)
+                    signal shared fence, publish slot           4. Latewarp (NGX, D3D12)
+                                                               5. blit → DirectComposition swapchain
+          ═══ shared memory "Local\FrameWarp_<pid>" ═══        GPU priority: realtime process class
+          ═══ shared D3D12 textures + fence (NT handles) ═══     + HIGH queue
+```
+
+## Source layout
+
+| Path | Role |
+|---|---|
+| `src/shared/protocol.hpp` | Shared-memory contract (slots, settings, status, diagnostics, event timeline). Version-checked. |
+| `src/shared/camera_motion.hpp` | Recovers frame-to-frame camera rotation + translation from `viewToClip` and `clipToPrevClip`. |
+| `src/addon/addon.cpp` | ReShade registration, `reshade_present` capture, presenter launch, ImGui panel. |
+| `src/addon/streamline_hooks.cpp` | Hooks for Streamline; runtime layout detection (BaseStructure size, ResourceTag stride); buffer classification. |
+| `src/addon/producer.cpp` | Slot management, GPU copies into shared textures, shared fence, camera position integration, event log. |
+| `src/addon/game_probe.cpp` | Byte-verified probes into Expedition 33's Unreal Streamline plugin (forces `ForceTagStreamlineBuffers()` true, counts calls). |
+| `src/common/inline_hook.cpp` | Minimal x64 inline hook (prologue relocation incl. RIP-relative, near relay, atomic patch). |
+| `src/presenter/main.cpp` | Presenter process: overlay window, raw input, render loop, logging, profile persistence. |
+| `src/presenter/renderer.cpp` | D3D12 device/queue, composition swapchain, shared-texture ingest + format conversion, blit, timing. |
+| `src/presenter/latewarp12.cpp` | NGX Latewarp on D3D12 (parameter names from `nvngx_latewarp.dll`). |
+| `src/presenter/pose.hpp` | Camera model: fitting, prediction/interpolation, handoff blending, cursor gate. |
+
+## Game side (add-on)
+
+* **Hooks.** `slSetConstants`, `slSetTag`, `slSetTagForFrame` (exports of `sl.interposer.dll`) and the
+  PCL marker function (via `slGetFeatureFunction`) are inline-hooked. The add-on module pins itself
+  because ReShade unloads/reloads add-ons during startup while hooks stay installed.
+* **Frame association.** Everything is keyed by Streamline frame token. In Expedition 33 the constants, tags, the
+  PCL present marker and the present call arrive in order on one thread per frame.
+* **Slots.** 4 slots, state machine `Free → Writing (game) → Ready (fence signalled) → Reading
+  (presenter) → Free`, with CAS transitions. The game never touches a slot being read.
+* **Copies only.** Tagged resources are copied with `CopyTextureRegion` in the game's own command
+  list at tag time (transition from the state Streamline reports → COPY_SOURCE and back). Depth is
+  copied in its planar typeless format. The backbuffer is copied at `reshade_present` (after ReShade's
+  effects and menu) and the shared fence is signalled on the game's queue.
+* **Camera position.** Streamline's `cameraPos` is camera-relative (always 0), so the add-on integrates
+  an absolute position every frame from `clipToPrevClip` (`camera_motion.hpp`); discontinuities bump
+  `position_epoch`.
+
+## Presenter
+
+* **Device and priority.** Own D3D12 device on the game's adapter (by LUID), direct queue at HIGH
+  priority, process GPU scheduling class REALTIME (falls back to HIGH), process CPU class HIGH, render
+  thread TIME_CRITICAL.
+* **Never waits on the game GPU.** A slot is taken only when the game's shared fence has already
+  completed (CPU check). Waiting on the GPU made every new frame cost 3 refreshes.
+* **Ingest.** Shared textures (opened by name per generation) are converted by a compute shader into
+  typed private textures (RGBA16F colour, R32F depth, zero RG16F motion) that Latewarp accepts.
+* **Latewarp.** On a new game frame a throwaway `IsRenderedFrame=1` evaluation registers it, followed
+  by the real evaluation with the predicted camera (Latewarp ignores the camera on rendered-frame
+  evaluations). View matrices are built relative to the source camera position for precision.
+* **Pacing.** A vblank clock is built from our swapchain's DXGI frame statistics. With present lead
+  > 0 (default 6 ms) the swapchain allows one queued frame and the render thread wakes `lead` ms
+  before each DWM composition deadline (vblank + 2.5 ms), rendering one frame per refresh; the
+  schedule resets whenever the overlay becomes visible again. Lead 0: frame latency 1, render when
+  the swapchain frees a buffer.
+* **Output.** A layered, transparent, no-activate, topmost window follows the game's client area; a
+  DirectComposition visual holds a flip-model composition swapchain (3 buffers, max latency 1,
+  waitable). The window is hidden when the game is not in front or no frames are available.
+
+## Camera model (`pose.hpp`)
+
+Per axis (yaw about world up, pitch):
+
+```
+theta(t) = theta_N + tau*w_N*(1 - exp(-h/tau)) + g * sum_i dc_i * (1 - exp(-(t - s_i)/tau))
+```
+
+* `theta_N`, `w_N`: angle and angular velocity of the newest game frame; `dc_i`: raw mouse counts at
+  `s_i` (shifted by input delay `d`); `tau`: the game's camera smoothing; `g`: radians per count.
+* `tau` and `d` by grid search, `g` by least squares, refitted every 30 frames on the game's own camera
+  history (frames with a visible cursor excluded).
+* Displayed camera time = `now − latency + setting`, where `latency` is the measured sim-to-ingest time.
+  Negative `h` interpolates between the last two real frames (angles and position exactly).
+* Translation: residual camera velocity (orbit + walking) extrapolated; manual orbit pivot optional.
+* Handoff: when a new frame arrives, the angular difference to the previous prediction is blended out
+  over 50 ms (positions are not blended — tested worse).
+
+## Shared memory protocol
+
+`Shared` (see `protocol.hpp`) contains: producer identity/session/adapter, backbuffer format and
+colour space, 4 `SlotMeta` (state, frame id, fence value, timestamps, `Camera` incl. matrices and
+position, per-texture info), `Settings` (written by the UI), `PresenterStatus` (written by the
+presenter), `HookStats` (diagnostics) and a 4096-entry event timeline ring. `kVersion` must match on
+both sides; object names embed the game PID and a per-device session id.

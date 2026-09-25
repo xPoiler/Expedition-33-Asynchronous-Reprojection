@@ -1,0 +1,165 @@
+# Installs (or removes) FrameWarp into any game that already has ReShade with full add-on support.
+#   powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Game "Expedition 33"        # Steam folder name (prefix ok)
+#   powershell -ExecutionPolicy Bypass -File tools\install.ps1 -GameDir "D:\Games\Foo"       # game folder or its exe
+#   powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Game "Expedition 33" -Latewarp "C:\Downloads\nvngx_latewarp.dll"
+#   powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Game "Expedition 33" -Uninstall
+# The files go next to ReShade (found by searching the folder). For Unreal Engine games the Streamline
+# force-tagging cvar is added to the user Engine.ini; everything the installer changed is recorded in
+# FrameWarp\install.json so -Uninstall reverts exactly that.
+param(
+    [string]$Game,
+    [string]$GameDir,
+    [string]$EngineIni,   # override the detected Unreal Engine.ini
+    [switch]$NoCvar,      # do not touch Engine.ini
+    [string]$Latewarp,    # path to nvngx_latewarp.dll (or a folder containing it)
+    [switch]$Uninstall
+)
+$ErrorActionPreference = "Stop"
+# Run from a release package (files next to this script) or from the source tree (build\Release).
+$root = Split-Path -Parent $PSScriptRoot
+$build = if (Test-Path (Join-Path $PSScriptRoot "FrameWarp.addon64")) { $PSScriptRoot } else { Join-Path $root "build\Release" }
+$cvar = "r.Streamline.ForceTagging=1"
+$reshadeNames = @("dxgi.dll", "d3d12.dll", "d3d11.dll", "dinput8.dll", "ReShade64.dll")
+
+function Get-SteamGameDirs {
+    $steam = (Get-ItemProperty -ErrorAction SilentlyContinue "HKCU:\Software\Valve\Steam").SteamPath
+    if (-not $steam) { $steam = "${env:ProgramFiles(x86)}\Steam" }
+    $vdf = Join-Path $steam "steamapps\libraryfolders.vdf"
+    $libraries = @($steam)
+    if (Test-Path $vdf) {
+        foreach ($m in [regex]::Matches((Get-Content -Raw $vdf), '"path"\s+"([^"]+)"')) { $libraries += $m.Groups[1].Value -replace '\\\\', '\' }
+    }
+    foreach ($lib in ($libraries | Select-Object -Unique)) {
+        $common = Join-Path $lib "steamapps\common"
+        if (Test-Path $common) { Get-ChildItem -Directory $common }
+    }
+}
+
+function Test-ReShade([string]$path) {
+    $info = (Get-Item $path).VersionInfo
+    return ($info.ProductName -match "ReShade") -or ($info.FileDescription -match "ReShade")
+}
+
+# Resolve the game folder.
+if ($GameDir) {
+    if (Test-Path -PathType Leaf $GameDir) { $GameDir = Split-Path -Parent $GameDir }
+    if (-not (Test-Path $GameDir)) { throw "Folder not found: $GameDir" }
+} elseif ($Game) {
+    $all = @(Get-SteamGameDirs | Sort-Object FullName -Unique)
+    $found = @($all | Where-Object { $_.Name -eq $Game })
+    if (-not $found) { $found = @($all | Where-Object { $_.Name -like "$Game*" }) }
+    if ($found.Count -eq 0) { throw "No Steam game folder matches '$Game'. Installed: $(($all | ForEach-Object Name) -join ', ')" }
+    if ($found.Count -gt 1) { throw "'$Game' matches several games: $(($found | ForEach-Object Name) -join ', ')" }
+    $GameDir = $found[0].FullName
+} else {
+    throw "Pass -Game <Steam folder name> or -GameDir <folder or exe>."
+}
+
+# ReShade's folder is where the add-on must go (it loads add-ons from its own directory).
+$reshade = @(Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Include $reshadeNames | Where-Object { Test-ReShade $_.FullName })
+if ($reshade.Count -eq 0) {
+    if ($Uninstall) { $installed = @(Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Filter "FrameWarp.addon64") }
+    if (-not $installed) { throw "ReShade not found under $GameDir (looked for $($reshadeNames -join ', ') made by ReShade)." }
+    $binDir = $installed[0].DirectoryName
+} else {
+    if (($reshade | Select-Object -ExpandProperty DirectoryName -Unique).Count -gt 1) {
+        throw "ReShade found in several folders: $(($reshade | ForEach-Object FullName) -join ', '). Pass the right one with -GameDir."
+    }
+    $binDir = $reshade[0].DirectoryName
+}
+$target = Join-Path $binDir "FrameWarp"
+$record = Join-Path $target "install.json"
+
+# The game must not be running (its exe lives in or below the game folder).
+$running = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($GameDir, [StringComparison]::OrdinalIgnoreCase) }
+if ($running) { throw "Close the game first ($(($running | ForEach-Object ProcessName | Select-Object -Unique) -join ', '))." }
+
+# Unreal Engine layout: <Game>\<Project>\Binaries\Win64\<exe>. The user config lives in
+# %LOCALAPPDATA%\<Project>\Saved\Config\Windows (or WinGDK for Game Pass builds).
+function Find-EngineIni {
+    if ((Split-Path -Leaf $binDir) -notmatch '^Win64$|^WinGDK$') { return $null }
+    $project = Split-Path -Leaf (Split-Path -Parent (Split-Path -Parent $binDir))
+    foreach ($platform in @("Windows", "WinGDK")) {
+        $dir = Join-Path $env:LOCALAPPDATA "$project\Saved\Config\$platform"
+        if (Test-Path $dir) { return Join-Path $dir "Engine.ini" }
+    }
+    return $null
+}
+
+function Set-Cvar([string]$ini, [bool]$enable) {
+    if (-not (Test-Path $ini)) { if ($enable) { New-Item -ItemType File -Force $ini | Out-Null } else { return } }
+    $backup = "$ini.framewarp-backup"
+    if ($enable -and -not (Test-Path $backup)) { Copy-Item $ini $backup }
+    $lines = [System.Collections.Generic.List[string]](@(Get-Content $ini))
+    $lines.RemoveAll({ param($l) $l.Trim() -eq $cvar }) | Out-Null
+    if ($enable) {
+        $i = $lines.FindIndex({ param($l) $l.Trim() -eq "[ConsoleVariables]" })
+        if ($i -lt 0) { $lines.Add(""); $lines.Add("[ConsoleVariables]"); $lines.Add($cvar) } else { $lines.Insert($i + 1, $cvar) }
+    }
+    # Performance mods often mark Engine.ini read-only so the game cannot rewrite it; keep that.
+    $item = Get-Item $ini
+    $readOnly = $item.IsReadOnly
+    if ($readOnly) { $item.IsReadOnly = $false }
+    try { Set-Content -Path $ini -Value $lines -Encoding UTF8 }
+    finally { if ($readOnly) { (Get-Item $ini).IsReadOnly = $true } }
+}
+
+if ($Uninstall) {
+    $info = if (Test-Path $record) { Get-Content -Raw $record | ConvertFrom-Json } else { $null }
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $binDir "FrameWarp.addon64")
+    $old = Join-Path $target "disabled\ReprojectionDiagnostics.addon64"
+    if (Test-Path $old) { Move-Item -Force $old $binDir }
+    if ($info -and $info.engine_ini) { Set-Cvar $info.engine_ini $false; Write-Host "Engine.ini: removed $cvar ($($info.engine_ini))" }
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $target
+    Write-Host "FrameWarp removed from $binDir"
+    return
+}
+
+foreach ($f in @("FrameWarp.addon64", "FrameWarp\FrameWarpPresenter.exe")) {
+    if (-not (Test-Path (Join-Path $build $f))) { throw "Missing $f in $build - build Release first." }
+}
+# nvngx_latewarp.dll is NVIDIA's and not redistributable: take it from -Latewarp, the package/build
+# folder, third_party\latewarp in the source tree, or an existing install.
+$latewarpCandidates = @()
+if ($Latewarp) { $latewarpCandidates += $(if (Test-Path -PathType Container $Latewarp) { Join-Path $Latewarp "nvngx_latewarp.dll" } else { $Latewarp }) }
+$latewarpCandidates += @((Join-Path $build "FrameWarp\nvngx_latewarp.dll"), (Join-Path $build "nvngx_latewarp.dll"),
+                         (Join-Path $root "third_party\latewarp\nvngx_latewarp.dll"),
+                         (Join-Path $target "nvngx_latewarp.dll"))
+$latewarpDll = $latewarpCandidates | Where-Object { Test-Path -PathType Leaf $_ } | Select-Object -First 1
+if (-not $latewarpDll) { throw "nvngx_latewarp.dll not found. Put NVIDIA's Reflex 2 Frame Warp DLL (bundled with software that uses Reflex 2 Frame Warp; tested version 310.2.0.0) next to install.bat, or pass -Latewarp <path to the dll>." }
+if (-not (Test-Path (Join-Path $env:SystemRoot "System32\msvcp140.dll"))) {
+    Write-Warning "Microsoft Visual C++ 2015-2022 Redistributable (x64) not found: the presenter needs it (https://aka.ms/vs/17/release/vc_redist.x64.exe)."
+}
+$previous = if (Test-Path $record) { Get-Content -Raw $record | ConvertFrom-Json } else { $null }
+New-Item -ItemType Directory -Force $target | Out-Null
+Copy-Item -Force (Join-Path $build "FrameWarp.addon64") $binDir
+Copy-Item -Force (Join-Path $build "FrameWarp\FrameWarpPresenter.exe") $target
+$latewarpTarget = Join-Path $target "nvngx_latewarp.dll"
+if ((Resolve-Path $latewarpDll).Path -ne $latewarpTarget) { Copy-Item -Force $latewarpDll $latewarpTarget }
+# The previous prototype's add-on captures every frame through an effect; park it (reversible).
+$old = Join-Path $binDir "ReprojectionDiagnostics.addon64"
+if (Test-Path $old) {
+    New-Item -ItemType Directory -Force (Join-Path $target "disabled") | Out-Null
+    Move-Item -Force $old (Join-Path $target "disabled")
+}
+Write-Host "Installed to $binDir (ReShade: $($reshade[0].Name))"
+
+# Streamline supplies the camera and depth/motion tags; without it the presenter has nothing to warp.
+$streamline = Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Filter "sl.interposer.dll" | Select-Object -First 1
+if ($streamline) { Write-Host "Streamline: $($streamline.FullName)" }
+else { Write-Warning "No Streamline (sl.interposer.dll) found: FrameWarp needs a game that uses NVIDIA Streamline (DLSS/Reflex via SL)." }
+
+$ini = $null
+if (-not $NoCvar) {
+    $ini = if ($EngineIni) { $EngineIni } elseif ($previous -and $previous.engine_ini) { $previous.engine_ini } else { Find-EngineIni }
+    if ($ini) {
+        Set-Cvar $ini $true
+        Write-Host "Engine.ini: $cvar under [ConsoleVariables] ($ini, backup: $ini.framewarp-backup)"
+    } elseif ((Split-Path -Leaf $binDir) -match '^Win64$|^WinGDK$') {
+        Write-Warning "Looks like Unreal Engine but no user config folder was found (run the game once, or pass -EngineIni)."
+    }
+    if ($ini -or (Split-Path -Leaf $binDir) -match '^Win64$|^WinGDK$') {
+        Write-Host "Unreal Engine + Streamline: add launch options  -slforcetagging -slviewextension"
+    }
+}
+@{ game_dir = $GameDir; bin_dir = $binDir; engine_ini = $ini; installed = (Get-Date -Format s) } | ConvertTo-Json | Set-Content -Encoding UTF8 $record

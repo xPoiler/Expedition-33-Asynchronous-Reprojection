@@ -1,0 +1,198 @@
+#include "presenter/pose.hpp"
+#include <cstdio>
+#include <cstdlib>
+
+using namespace fw;
+
+static int failures = 0;
+#define EXPECT(cond, ...) do { if (!(cond)) { ++failures; std::printf("FAIL %s:%d: ", __FILE__, __LINE__); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
+
+static const Vec3 kUp{0, 0, 1};  // Unreal: Z up
+static CameraBasis camera_at(double yaw, double pitch) {
+    CameraBasis c{{}, {0, 1, 0}, {0, 0, 1}, {1, 0, 0}};  // UE: fwd +X, right +Y, up +Z
+    return apply_rotation(c, kUp, yaw, pitch, c.pos);
+}
+
+static void rotation_conventions() {
+    const CameraBasis base = camera_at(0, 0);
+    const CameraBasis turned = apply_rotation(base, kUp, 0.3, 0.0, base.pos);
+    EXPECT(std::fabs(yaw_between(base.fwd, turned.fwd, kUp) - 0.3) < 1e-9, "yaw measured %f", yaw_between(base.fwd, turned.fwd, kUp));
+    const CameraBasis raised = apply_rotation(base, kUp, 0.0, 0.2, base.pos);
+    EXPECT(std::fabs(elevation(raised.fwd, kUp) - 0.2) < 1e-9, "pitch measured %f", elevation(raised.fwd, kUp));
+    EXPECT(std::fabs(dot(raised.right, raised.fwd)) < 1e-9 && std::fabs(dot(raised.up, raised.fwd)) < 1e-9, "basis orthogonal");
+    EXPECT(elevation(apply_rotation(base, kUp, 0.0, 3.0, base.pos).fwd, kUp) < 1.54, "pitch clamps below 88 deg");
+    const Vec3 pivot = base.pos + base.fwd * 300.0;
+    const CameraBasis orbit = apply_rotation(base, kUp, 0.5, 0.0, pivot);
+    EXPECT(length(orbit.pos + orbit.fwd * 300.0 - pivot) < 1e-6, "orbit keeps pivot");
+    const Mat4 v = view_matrix(turned, {});
+    const double z = turned.fwd.x * v[2] + turned.fwd.y * v[6] + turned.fwd.z * v[10];
+    EXPECT(std::fabs(z - 1.0) < 1e-6, "forward maps to +z (%f)", z);
+}
+
+// A game whose camera follows target = gain * counts through a first-order lag (like E33),
+// rendering at `fps` and consuming input `delay` after each simulation start.
+struct Game {
+    double gain_x = -0.0023, gain_y = 0.0015, tau = 0.15, delay = 0.01, fps = 30.0, latency = 0.02;
+    double cam[2] = {0, 0}, target[2] = {0, 0};
+    double t = 0, next_frame = 0.0, last_sim = 0;
+    std::uint64_t frame = 0;
+    std::vector<std::pair<double, long>> pending_x, pending_y;
+    struct Out { double t, yaw, pitch; };
+    std::vector<Out> truth;  // camera at every 1 ms step
+    PoseModel* model = nullptr;
+    bool feed_model = true;
+    // Advances 1 ms: mouse event, camera integration, maybe a rendered frame.
+    void step(long dx, long dy) {
+        t += 0.001;
+        if (dx || dy) model->mouse.add(t, dx, dy);
+        target[0] += gain_x * dx; target[1] += gain_y * dy;
+        // The game applies input with `delay`, smoothing continuously.
+        const double a = 1.0 - std::exp(-0.001 / tau);
+        cam[0] += (target_at_delay(0) - cam[0]) * a;
+        cam[1] += (target_at_delay(1) - cam[1]) * a;
+        history_target.push_back({t, target[0], target[1]});
+        truth.push_back({t, cam[0], cam[1]});
+        if (t >= next_frame) {
+            next_frame += 1.0 / fps;
+            // Rendered now, reaches the presenter `latency` later (like the real pipeline).
+            in_flight.push_back({t, cam[0], cam[1]});
+        }
+        while (!in_flight.empty() && t >= in_flight.front().t + latency) {
+            const auto f = in_flight.front();
+            in_flight.erase(in_flight.begin());
+            last_sim = f.t;
+            if (feed_model) model->add_source(++frame, f.t, t, camera_at(f.yaw, f.pitch), false, t);
+        }
+    }
+    std::vector<Out> in_flight;
+    struct T3 { double t, x, y; };
+    std::vector<T3> history_target;
+    double target_at_delay(int axis) const {
+        const double when = t - delay;
+        for (auto it = history_target.rbegin(); it != history_target.rend(); ++it)
+            if (it->t <= when) return axis ? it->y : it->x;
+        return 0;
+    }
+    double truth_at(double when, int axis) const {
+        for (auto it = truth.rbegin(); it != truth.rend(); ++it)
+            if (it->t <= when) return axis ? it->pitch : it->yaw;
+        return 0;
+    }
+};
+
+// 125 Hz mouse reports of a few counts (like the recorded session): < 1 rad/s camera motion.
+static bool report(double t) { return (static_cast<long>(std::lround(t * 1000.0)) % 8) == 0; }
+static long pattern_x(double t) { return report(t) ? long(std::lround(3.0 * std::sin(t * 2.3) + 1.5 * std::sin(t * 7.1) + 1.0 * std::sin(t * 0.7))) : 0; }
+static long pattern_y(double t) { return report(t) ? long(std::lround(1.5 * std::cos(t * 1.9) + 1.0 * std::sin(t * 5.3))) : 0; }
+
+static void fit_recovers_smoothed_camera() {
+    PoseModel model;
+    Game g; g.model = &model;
+    for (int i = 0; i < 20000; ++i) g.step(pattern_x(g.t), pattern_y(g.t));
+    model.fit();
+    const auto& x = model.params(0);
+    const auto& y = model.params(1);
+    EXPECT(x.fitted && y.fitted, "fitted");
+    // tau, gain and delay partly trade off on short windows; what matters is that smoothing is found.
+    EXPECT(x.tau >= 0.05, "yaw smoothing detected: tau %.3f (true %.3f)", x.tau, g.tau);
+    EXPECT(std::fabs(x.gain / g.gain_x - 1.0) < 0.2, "yaw gain %g (true %g)", x.gain, g.gain_x);
+    EXPECT(std::fabs(y.gain / g.gain_y - 1.0) < 0.2, "pitch gain %g (true %g)", y.gain, g.gain_y);
+    EXPECT(x.quality > 0.7, "yaw quality %.2f", x.quality);
+}
+
+// Displayed camera vs the true camera at the displayed time, and smoothness at 120 Hz.
+static void prediction_is_accurate_and_continuous() {
+    PoseModel model;
+    Game g; g.model = &model;
+    for (int i = 0; i < 20000; ++i) g.step(pattern_x(g.t), pattern_y(g.t));  // learn
+    double sse = 0, hold_sse = 0, worst_step = 0, worst_true_step = 0;
+    int n = 0;
+    double prev_shown = 0, prev_true = 0;
+    bool have_prev = false;
+    for (int i = 0; i < 3000; ++i) {
+        g.step(pattern_x(g.t), pattern_y(g.t));
+        if (i % 8 != 0) continue;  // 125 Hz output
+        const double now = g.t;
+        const Prediction p = model.predict(now);
+        const double shown = model.source_theta(0) + p.yaw;
+        const double truth = g.truth_at(g.last_sim + p.horizon, 0);
+        const double hold = model.source_theta(0);
+        sse += (shown - truth) * (shown - truth);
+        hold_sse += (hold - truth) * (hold - truth);
+        if (have_prev) {
+            worst_step = std::max(worst_step, std::fabs(shown - prev_shown));
+            worst_true_step = std::max(worst_true_step, std::fabs(truth - prev_true));
+        }
+        prev_shown = shown; prev_true = truth; have_prev = true;
+        ++n;
+    }
+    const double rms = std::sqrt(sse / n), hold_rms = std::sqrt(hold_sse / n);
+    std::printf("  tracking rms %.2f mrad vs hold %.2f mrad; worst 8 ms step %.2f mrad (true %.2f)\n", rms * 1000, hold_rms * 1000,
+                worst_step * 1000, worst_true_step * 1000);
+    EXPECT(rms < hold_rms * 0.3, "prediction must beat holding the frame by a wide margin");
+    EXPECT(worst_step < worst_true_step * 2.0 + 0.002, "no snaps at frame handoffs");
+}
+
+static void cursor_gate_blocks_mouse() {
+    PoseModel model;
+    Game g; g.model = &model;
+    for (int i = 0; i < 20000; ++i) g.step(pattern_x(g.t), pattern_y(g.t));
+    g.feed_model = false;
+    for (int i = 0; i < 5; ++i) g.step(0, 0);
+    model.mouse.add(g.t + 0.0005, 400, 0);
+    // Manual latency 0 (prediction mode): at the auto setting (-1 frame) the camera is interpolated
+    // between two known frames and the mouse is intentionally not used.
+    PoseSettings ps; ps.rotation_extrapolation = 0.0; ps.max_horizon = 0.2; ps.auto_fraction = 0.0;
+    model.configure(ps);
+    model.set_mouse_gate(true);
+    const double open = model.predict(g.t + 0.05).yaw;
+    model.set_mouse_gate(false);
+    const double closed = model.predict(g.t + 0.05).yaw;
+    EXPECT(std::fabs(open) > 0.05, "open gate uses the mouse (%f)", open);
+    EXPECT(std::fabs(closed) < std::fabs(open) * 0.05, "closed gate ignores the mouse (%f)", closed);
+}
+
+static void auto_latency_tracks_frame_interval() {
+    PoseModel model;
+    Game g; g.model = &model;
+    g.fps = 40.0;
+    for (int i = 0; i < 6000; ++i) g.step(pattern_x(g.t), pattern_y(g.t));
+    EXPECT(std::fabs(model.frame_interval() - 0.025) < 0.0015, "frame interval %.4f (40 fps)", model.frame_interval());
+    EXPECT(std::fabs(model.effective_prediction() + model.frame_interval()) < 1e-9, "auto = -1 frame");
+    for (double fraction : {0.5, 0.25}) {
+        PoseSettings ps; ps.auto_fraction = fraction;
+        model.configure(ps);
+        EXPECT(std::fabs(model.effective_prediction() + fraction * model.frame_interval()) < 1e-9, "auto = -%.2f frame", fraction);
+    }
+    model.configure(PoseSettings{});
+    double worst = 0, prev = 0; bool have = false;
+    for (int i = 0; i < 2000; ++i) {
+        g.step(pattern_x(g.t), pattern_y(g.t));
+        if (i % 8) continue;
+        const Prediction p = model.predict(g.t);
+        const double shown = model.source_theta(0) + p.yaw;
+        EXPECT(p.horizon <= 0.001, "auto mode never extrapolates beyond the newest frame (h %.4f)", p.horizon);
+        if (have) worst = std::max(worst, std::fabs(shown - prev));
+        prev = shown; have = true;
+    }
+    EXPECT(worst < 0.02, "auto mode output continuous (worst step %.4f rad)", worst);
+}
+
+static void world_up_detection() {
+    WorldUp up;
+    for (int i = 0; i < 20; ++i) up.add(camera_at(i * 0.3, 0.1 * std::sin(i)));
+    const Vec3 u = up.get();
+    EXPECT(u.z == 1.0 && u.x == 0.0 && u.y == 0.0, "world up %f %f %f", u.x, u.y, u.z);
+}
+
+int main() {
+    rotation_conventions();
+    fit_recovers_smoothed_camera();
+    prediction_is_accurate_and_continuous();
+    cursor_gate_blocks_mouse();
+    auto_latency_tracks_frame_interval();
+    world_up_detection();
+    if (failures) { std::printf("%d failure(s)\n", failures); return 1; }
+    std::printf("pose tests passed\n");
+    return 0;
+}
