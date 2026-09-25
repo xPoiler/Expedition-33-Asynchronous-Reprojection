@@ -36,7 +36,7 @@ Other games that use NVIDIA Streamline for DLSS may work but are untested.
 ## Install
 
 1. Download the latest `FrameWarp-<version>.zip` from
-   [Releases](https://github.com/xPoiler/Expedition-33-Asynchronous-Reprojection/releases) and
+   [Releases](https://github.com/xPoiler/Reshade-Asynchronous-Reprojection/releases) and
    extract it.
 2. Put `nvngx_latewarp.dll` next to `install.bat`.
 3. Close the game and double-click `install.bat`. It lists your Steam games that have ReShade; type
