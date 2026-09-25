@@ -32,10 +32,8 @@ std::uint32_t to_dxgi_color_space(color_space cs) {
 void launch_presenter() {
     if (g_presenter_launched) return;
     g_presenter_launched = true;
-    if (GetFileAttributesW(g_presenter_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        g_producer->set_message("FrameWarp\\FrameWarpPresenter.exe not found next to the add-on");
-        return;
-    }
+    // No existence pre-check: mod loaders (e.g. REFramework) hook the game's file APIs and can make the
+    // presenter look missing to GetFileAttributes while CreateProcess still finds it.
     std::wstring cmd = L"\"" + g_presenter_path + L"\" --pid " + std::to_wstring(GetCurrentProcessId());
     const std::wstring dir = g_presenter_path.substr(0, g_presenter_path.find_last_of(L"\\/"));
     STARTUPINFOW si{sizeof(si)};
@@ -44,7 +42,11 @@ void launch_presenter() {
         CloseHandle(pi.hThread);
         g_presenter_process = pi.hProcess;
     } else {
-        g_producer->set_message("Failed to start FrameWarpPresenter.exe");
+        const DWORD error = GetLastError();
+        char text[160];
+        std::snprintf(text, sizeof(text), "Failed to start FrameWarp\\FrameWarpPresenter.exe (Windows error %lu%s)", error,
+                      error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? ": not found next to the add-on" : "");
+        g_producer->set_message(text);
     }
 }
 

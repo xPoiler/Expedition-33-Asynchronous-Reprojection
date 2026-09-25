@@ -62,10 +62,21 @@ if ($reshade.Count -eq 0) {
     if (-not $installed) { throw "ReShade not found under $GameDir (looked for $($reshadeNames -join ', ') made by ReShade)." }
     $binDir = $installed[0].DirectoryName
 } else {
-    if (($reshade | Select-Object -ExpandProperty DirectoryName -Unique).Count -gt 1) {
-        throw "ReShade found in several folders: $(($reshade | ForEach-Object FullName) -join ', '). Pass the right one with -GameDir."
+    $dirs = @($reshade | Select-Object -ExpandProperty DirectoryName -Unique)
+    if ($dirs.Count -gt 1) {
+        # Mod managers keep backup copies (e.g. a _storage_ folder). The live ReShade sits next to the
+        # game's executable; among those, take the one closest to the game folder.
+        $withExe = @($dirs | Where-Object { Get-ChildItem -File -Filter "*.exe" $_ -ErrorAction SilentlyContinue })
+        if ($withExe.Count -gt 0) { $dirs = $withExe }
+        $depth = { param($d) ($d.TrimEnd('\') -split '\\').Count }
+        $minDepth = ($dirs | ForEach-Object { & $depth $_ } | Measure-Object -Minimum).Minimum
+        $dirs = @($dirs | Where-Object { (& $depth $_) -eq $minDepth })
+        if ($dirs.Count -gt 1) {
+            throw "ReShade found in several folders: $(($reshade | ForEach-Object FullName) -join ', '). Pass the right one with -GameDir."
+        }
     }
-    $binDir = $reshade[0].DirectoryName
+    $binDir = $dirs[0]
+    $reshade = @($reshade | Where-Object { $_.DirectoryName -eq $binDir })
 }
 $target = Join-Path $binDir "FrameWarp"
 $record = Join-Path $target "install.json"
