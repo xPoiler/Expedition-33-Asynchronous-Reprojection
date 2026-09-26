@@ -77,18 +77,22 @@ struct FrameMotion {
 };
 
 // sample_depths are view-space distances in game units (UE: cm) for the translation fit.
-inline FrameMotion recover_motion(const float* view_to_clip, const float* clip_to_prev_clip) {
+// prev_view_to_clip: the previous frame's projection. clipToPrevClip maps into the previous frame's clip
+// space, so a zoom (FOV change, e.g. aiming) between the frames must be undone with that frame's own
+// projection - with the current one it reads as a large forward/backward move.
+inline FrameMotion recover_motion(const float* view_to_clip, const float* clip_to_prev_clip, const float* prev_view_to_clip = nullptr) {
     FrameMotion out;
     const M4 P = m4_from(view_to_clip), C = m4_from(clip_to_prev_clip);
-    M4 Pinv;
-    if (!invert(P, Pinv)) return out;
+    const M4 Pp = m4_from(prev_view_to_clip ? prev_view_to_clip : view_to_clip);
+    M4 Pinv, Pinv_prev;
+    if (!invert(P, Pinv) || !invert(Pp, Pinv_prev)) return out;
     // The near-plane scale: for reversed-Z infinite projections clip.z = near * w_view, i.e. the
     // clip-space z of a point at view depth d is near/d. near = P[3][2] (row-vector layout).
     const double near_plane = std::fabs(P[3][2]) > 1e-9 ? std::fabs(P[3][2]) : 1.0;
     auto view_point = [&](double x, double y, double z_clip, const M4& map, bool mapped) -> V3 {
         std::array<double, 4> c{x, y, z_clip, 1.0};
         if (mapped) c = mul(c, map);
-        const auto v = mul(c, Pinv);
+        const auto v = mul(c, mapped ? Pinv_prev : Pinv);
         return {v[0] / v[3], v[1] / v[3], v[2] / v[3]};
     };
     constexpr std::size_t kGrid = 25;

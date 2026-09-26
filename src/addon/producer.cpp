@@ -195,7 +195,13 @@ void Producer::on_constants(std::uint64_t frame, const Camera& camera) {
     // never reach the presenter) so translation - e.g. a third-person orbit - is known.
     Camera cam = camera;
     {
-        const FrameMotion motion = recover_motion(camera.view_to_clip, camera.clip_to_prev_clip);
+        // The previous frame's zoom and near plane (they change while aiming in some games); the jitter
+        // terms stay the current frame's, so games whose projection only jitters behave exactly as before.
+        float previous_projection[16];
+        std::memcpy(previous_projection, have_prev_camera_ ? prev_view_to_clip_ : camera.view_to_clip, sizeof(previous_projection));
+        previous_projection[8] = camera.view_to_clip[8];
+        previous_projection[9] = camera.view_to_clip[9];
+        const FrameMotion motion = recover_motion(camera.view_to_clip, camera.clip_to_prev_clip, previous_projection);
         double t[3] = {motion.translation[0], motion.translation[1], motion.translation[2]};
         const double step = std::sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
         if (have_prev_camera_ && frame == prev_frame_ + 1 && !camera.reset && motion.valid && step < 1000.0) {
@@ -211,6 +217,7 @@ void Producer::on_constants(std::uint64_t frame, const Camera& camera) {
             prev_right_[i] = camera.right[i]; prev_up_[i] = camera.up[i]; prev_fwd_[i] = camera.fwd[i];
             cam.pos[i] = static_cast<float>(world_pos_[i]);
         }
+        std::memcpy(prev_view_to_clip_, camera.view_to_clip, sizeof(prev_view_to_clip_));
         cam.position_epoch = position_epoch_;
         prev_frame_ = frame;
         have_prev_camera_ = true;

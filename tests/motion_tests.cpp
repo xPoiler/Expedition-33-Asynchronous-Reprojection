@@ -36,7 +36,33 @@ static void recovers(double yaw, double pitch, V3 t, double near_plane) {
     EXPECT(terr < 0.05 + 0.002 * std::sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]), "translation error %g (t %g %g %g)", terr, t[0], t[1], t[2]);
 }
 
+// A zoom between the frames (aiming: the FOV narrows) with a still camera must not read as movement.
+static void zoom_is_not_motion(double zoom, V3 t, double near_change = 1.0) {
+    const float P[16] = {1.1667f, 0, 0, 0, 0, 2.0741f, 0, 0, 0, 0, 0, 1, 0, 0, 1.0f, 0};
+    float Pp[16];
+    for (int i = 0; i < 16; ++i) Pp[i] = P[i];
+    Pp[0] = float(P[0] / zoom); Pp[5] = float(P[5] / zoom);  // previous frame: wider field of view
+    Pp[14] = float(P[14] / near_change);                      // ... and (RE9 when aiming) another near plane
+    M4 Mrow{};
+    for (int i = 0; i < 4; ++i) Mrow[i][i] = 1;
+    for (int j = 0; j < 3; ++j) Mrow[3][j] = t[j];
+    M4 Pinv; invert(m4_from(P), Pinv);
+    const M4 C = mm(mm(Pinv, Mrow), m4_from(Pp));  // clip_prev = clip_cur * Pinv_cur * M * P_prev
+    float Cf[16];
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) Cf[i * 4 + j] = float(C[i][j]);
+    const FrameMotion with_prev = recover_motion(P, Cf, Pp), without = recover_motion(P, Cf);
+    double err = 0, naive = 0;
+    for (int i = 0; i < 3; ++i) { err = std::max(err, std::fabs(with_prev.translation[i] - t[i])); naive = std::max(naive, std::fabs(without.translation[i] - t[i])); }
+    std::printf("zoom %.2f, move (%g %g %g): translation error %.4f with the previous projection, %.1f without\n", zoom, t[0], t[1], t[2], err, naive);
+    EXPECT(with_prev.valid && err < 0.05, "zoom does not read as motion (error %g)", err);
+}
+
 int main() {
+    zoom_is_not_motion(1.06, {0, 0, 0});
+    zoom_is_not_motion(0.94, {0, 0, -30});
+    zoom_is_not_motion(1.10, {5, 0, 20});
+    zoom_is_not_motion(1.06, {0, 0, 0}, 1.1);    // RE9 aim: zoom + near plane change, camera still
+    zoom_is_not_motion(0.94, {0, 0, -3}, 0.9);   // ... while walking backwards
     recovers(0, 0, {0, 0, 0}, 1.0);
     recovers(0.02, -0.01, {0, 0, 0}, 1.0);
     recovers(0.03, 0.015, {5.0, -2.0, 1.5}, 1.0);     // orbit-like step (cm)

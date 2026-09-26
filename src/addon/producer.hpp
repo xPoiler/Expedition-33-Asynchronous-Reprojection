@@ -69,6 +69,7 @@ private:
     std::uint32_t position_epoch_ = 0;
     double world_pos_[3] = {0, 0, 0};
     float prev_right_[3]{}, prev_up_[3]{}, prev_fwd_[3]{};
+    float prev_view_to_clip_[16]{};  // previous frame's projection (zoom / near plane changes, see recover_motion)
     std::int64_t sim_start_qpc_[64]{};
 };
 
