@@ -371,10 +371,13 @@ int main(int argc, char** argv) {
             list->ClearRenderTargetView(rtv, back, 0, nullptr);
             const D3D12_RECT bar{LONG(W / 2) - 4 + bar_dx, 0, LONG(W / 2) + 4 + bar_dx, LONG(H)};
             list->ClearRenderTargetView(rtv, white, 1, &bar);
-            if (hud_patch) {  // textured like real HUD (text, icons): 2 px green/black stripes
-                for (LONG x = hx0; x < hx1; x += 4) {
+            if (hud_patch) {  // textured like real HUD (text, icons): 2 px stripes
+                // 0: opaque green; 1: teal, shifted 2 px (the content changed); 2: green at 50% over the scene
+                const float blend[4] = {0.5f * bg, 0.5f * bg + 0.5f, 0.5f * bg, 1};
+                const float* colour = hud_patch_colour == 1 ? teal : hud_patch_colour == 2 ? blend : green;
+                for (LONG x = hx0 + (hud_patch_colour == 1 ? 2 : 0); x < hx1; x += 4) {
                     const D3D12_RECT stripe{x, hy0, std::min(x + 2, hx1), hy1};
-                    list->ClearRenderTargetView(rtv, hud_patch_colour ? teal : green, 1, &stripe);
+                    list->ClearRenderTargetView(rtv, colour, 1, &stripe);
                 }
             }
             std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
@@ -411,7 +414,7 @@ int main(int argc, char** argv) {
                 for (std::uint32_t x = 0; x < w / 2; ++x) {
                     const std::size_t i = (std::size_t(y) * w + x) * 4;
                     const float g = half_to_float(px[i + 1]) - half_to_float(px[i]);
-                    if (g > 0.5f) { sum += x * g; weight += g; }
+                    if (g > 0.3f) { sum += x * g; weight += g; }
                 }
             return weight > 0 ? sum / weight : -1.0;
         };
@@ -460,7 +463,7 @@ int main(int argc, char** argv) {
         const double patch_x0 = green_x(), bar_x0 = peak(px, w, h, true, 1);
         show(hud_src, yaw);
         const double patch_x1 = green_x(), bar_x1 = peak(px, w, h, true, 1);
-        // (C) What was HUD changes (a weapon moved away, scenery behind it): unmasked in the very next frame.
+        // (C) What was HUD changes (its content moved: scenery now): unmasked in the next frame.
         hud_patch_colour = 1;
         IngestedSource changed_src = ingest_frame(publish(310, 0.1f, 12, false, true), true, false);
         show(changed_src, 0);
@@ -468,8 +471,30 @@ int main(int argc, char** argv) {
         show(changed_src, yaw);
         const double gone_x1 = green_x();
         hud_patch_colour = 0;
-        std::printf("no-warp mask: weapon strip x %.0f -> %.0f; HUD patch x %.1f -> %.1f, scene bar x %.0f -> %.0f; changed patch x %.1f -> %.1f (5 deg yaw)\n",
-                    weapon_x0, weapon_x1, patch_x0, patch_x1, bar_x0, bar_x1, gone_x0, gone_x1);
+        // (D) A first-person weapon held still on screen for many frames never enters the HUD map: the
+        // frame after it is gone, that area warps.
+        renderer.reset_hud_detection();
+        for (int i = 0; i < 7; ++i) ingest_frame(publish(400 + i, (i & 1) ? 0.3f : 0.1f, 0, true, false), true, true);
+        IngestedSource after_src = ingest_frame(publish(410, 0.1f, 0, false, false), true, true);
+        show(after_src, 0);
+        const double after_x0 = peak(px, w, h, true, 1);
+        show(after_src, yaw);
+        const double after_x1 = peak(px, w, h, true, 1);
+        // (E) Semi-transparent HUD (50% over a scene that changes every frame): detected by its edges.
+        renderer.reset_hud_detection();
+        hud_patch_colour = 2;
+        IngestedSource glass_src{};
+        for (int i = 0; i < 7; ++i) glass_src = ingest_frame(publish(500 + i, (i & 1) ? 0.3f : 0.1f, (i & 1) ? 12 : -12, false, true), true, false);
+        show(glass_src, 0);
+        const double glass_x0 = green_x();
+        show(glass_src, yaw);
+        const double glass_x1 = green_x();
+        hud_patch_colour = 0;
+        std::printf("no-warp mask: weapon strip x %.0f -> %.0f; HUD patch x %.1f -> %.1f, scene bar x %.0f -> %.0f; changed patch x %.1f -> %.1f; "
+                    "after weapon x %.0f -> %.0f; semi-transparent patch x %.1f -> %.1f (5 deg yaw)\n",
+                    weapon_x0, weapon_x1, patch_x0, patch_x1, bar_x0, bar_x1, gone_x0, gone_x1, after_x0, after_x1, glass_x0, glass_x1);
+        EXPECT(std::fabs(after_x1 - after_x0) > 20.0, "where a held weapon was, the scene warps the next frame (%.0f -> %.0f)", after_x0, after_x1);
+        EXPECT(glass_x0 > 0 && std::fabs(glass_x1 - glass_x0) < 2.0, "semi-transparent HUD is not warped (%.1f -> %.1f)", glass_x0, glass_x1);
         EXPECT(gone_x0 > 0 && gone_x1 < gone_x0 - 20.0, "a former HUD area that changed warps again in the next frame");
         EXPECT(std::fabs(weapon_x1 - weapon_x0) < 2.0, "camera-attached strip (motion vectors ignore the camera) is not warped");
         EXPECT(std::fabs(sky_x1 - sky_x0) > 20.0, "a far zero-motion strip (sky) is still warped (%.0f -> %.0f)", sky_x0, sky_x1);

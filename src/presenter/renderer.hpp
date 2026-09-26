@@ -88,7 +88,8 @@ public:
     // hud: pixels that stay unchanged while the camera moves the scene under them (needs the previous
     // colour, see set_keep_previous_colour); attached: pixels whose motion vectors ignore the camera
     // (first-person weapon). Returns the R8 mask at output resolution, kept for the frame's outputs.
-    ID3D12Resource* build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached);
+    ID3D12Resource* build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached,
+                                       bool depth_inverted = true);
     ID3D12Resource* no_warp_mask() const { return mask_ready_ ? private_[kPMask].texture.Get() : nullptr; }
     void reset_hud_detection() { reset_hud_ = true; mask_ready_ = false; }
 
