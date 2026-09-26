@@ -360,7 +360,8 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 16; ++i) moving_cam.clip_to_prev_clip[i] = (i % 5 == 0) ? 1.0f : 0.0f;
         moving_cam.clip_to_prev_clip[12] = 2.0f * shift;  // row-vector: prev.x = x + 2*shift*w (clip), i.e. +shift in uv
         const LONG hx0 = LONG(W / 8), hx1 = LONG(W / 4), hy0 = LONG(H / 8), hy1 = LONG(H / 4);
-        const float green[4] = {0, 1, 0, 1};
+        const float green[4] = {0, 1, 0, 1}, teal[4] = {0, 0.7f, 0.6f, 1};
+        int hud_patch_colour = 0;
         auto publish = [&](std::uint64_t fid, float bg, LONG bar_dx, bool weapon, bool hud_patch, bool near_strip = true) -> int {
             alloc->Reset();
             list->Reset(alloc.Get(), nullptr);
@@ -373,7 +374,7 @@ int main(int argc, char** argv) {
             if (hud_patch) {  // textured like real HUD (text, icons): 2 px green/black stripes
                 for (LONG x = hx0; x < hx1; x += 4) {
                     const D3D12_RECT stripe{x, hy0, std::min(x + 2, hx1), hy1};
-                    list->ClearRenderTargetView(rtv, green, 1, &stripe);
+                    list->ClearRenderTargetView(rtv, hud_patch_colour ? teal : green, 1, &stripe);
                 }
             }
             std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
@@ -459,8 +460,17 @@ int main(int argc, char** argv) {
         const double patch_x0 = green_x(), bar_x0 = peak(px, w, h, true, 1);
         show(hud_src, yaw);
         const double patch_x1 = green_x(), bar_x1 = peak(px, w, h, true, 1);
-        std::printf("no-warp mask: weapon strip x %.0f -> %.0f; HUD patch x %.1f -> %.1f, scene bar x %.0f -> %.0f (5 deg yaw)\n",
-                    weapon_x0, weapon_x1, patch_x0, patch_x1, bar_x0, bar_x1);
+        // (C) What was HUD changes (a weapon moved away, scenery behind it): unmasked in the very next frame.
+        hud_patch_colour = 1;
+        IngestedSource changed_src = ingest_frame(publish(310, 0.1f, 12, false, true), true, false);
+        show(changed_src, 0);
+        const double gone_x0 = green_x();
+        show(changed_src, yaw);
+        const double gone_x1 = green_x();
+        hud_patch_colour = 0;
+        std::printf("no-warp mask: weapon strip x %.0f -> %.0f; HUD patch x %.1f -> %.1f, scene bar x %.0f -> %.0f; changed patch x %.1f -> %.1f (5 deg yaw)\n",
+                    weapon_x0, weapon_x1, patch_x0, patch_x1, bar_x0, bar_x1, gone_x0, gone_x1);
+        EXPECT(gone_x0 > 0 && gone_x1 < gone_x0 - 20.0, "a former HUD area that changed warps again in the next frame");
         EXPECT(std::fabs(weapon_x1 - weapon_x0) < 2.0, "camera-attached strip (motion vectors ignore the camera) is not warped");
         EXPECT(std::fabs(sky_x1 - sky_x0) > 20.0, "a far zero-motion strip (sky) is still warped (%.0f -> %.0f)", sky_x0, sky_x1);
         EXPECT(patch_x0 > 0 && std::fabs(patch_x1 - patch_x0) < 2.0, "static HUD patch is not warped");

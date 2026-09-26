@@ -194,22 +194,27 @@ float4 bilinear(Texture2D<float4> t, float2 pos) {  // pos in texel centres (0.5
     out_u[id.xy] = colour_t.Load(int3(id.xy, 0));
 }
 
-// HUD score (output resolution): rises where a pixel stays the same between game frames while the
-// camera moved the scene under it (overlay), falls where it changes. Only frames with camera motion
-// at that pixel update it.
+// HUD score (output resolution). Slow to rise, instant to fall: it rises where a textured pixel stays
+// identical between game frames while the camera moved the scene under it (overlay), and drops to zero
+// as soon as a pixel clearly changes, camera moving or not - a HUD element never moves, so anything
+// that changes (a weapon that moved away, scenery) is not HUD.
 Texture2D<float4> hud_current_t : register(t0);
 Texture2D<float4> hud_previous_t : register(t1);
 Texture2D<float> hud_depth_t : register(t2);
 RWTexture2D<float> hud_score_u : register(u0);
 [numthreads(8, 8, 1)] void cs_hud(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= out_size) || !(flags & 2)) return;
+    const float3 delta = abs(hud_current_t.Load(int3(id.xy, 0)).rgb - hud_previous_t.Load(int3(id.xy, 0)).rgb);
+    const float change = max(delta.r, max(delta.g, delta.b));
+    if (change > 0.06) { hud_score_u[id.xy] = 0; return; }
+    if (change > 0.03) return;
     const float2 uv = (float2(id.xy) + 0.5) / float2(out_size);
     const int2 pr = int2(rect.xy) + int2(min(uint2(uv * float2(rect.zw)), rect.zw - 1));
     const float4 pv = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, hud_depth_t.Load(int3(pr, 0)), 1), clip_to_prev);
     if (pv.w <= 0) return;
     const float2 cam_px = (float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5) - uv) * float2(out_size);
-    if (dot(cam_px, cam_px) < 9.0) return;  // needs >= 3 px of camera motion here to tell
-    // Flat areas (sky, plain walls) look the same whether they moved or not: no evidence either way.
+    if (dot(cam_px, cam_px) < 9.0) return;  // needs >= 3 px of camera motion here to count as evidence
+    // Flat areas (sky, plain walls) look the same whether they moved or not: no evidence.
     float lo = 1e9, hi = -1e9;
     [unroll] for (int y = -1; y <= 1; ++y)
         [unroll] for (int x = -1; x <= 1; ++x) {
@@ -218,9 +223,7 @@ RWTexture2D<float> hud_score_u : register(u0);
             lo = min(lo, l); hi = max(hi, l);
         }
     if (hi - lo < 0.08) return;
-    const float3 delta = abs(hud_current_t.Load(int3(id.xy, 0)).rgb - hud_previous_t.Load(int3(id.xy, 0)).rgb);
-    const bool same = max(delta.r, max(delta.g, delta.b)) < 0.03;
-    hud_score_u[id.xy] = lerp(hud_score_u[id.xy], same ? 1.0 : 0.0, 0.2);
+    hud_score_u[id.xy] = lerp(hud_score_u[id.xy], 1.0, 0.2);
 }
 
 [numthreads(8, 8, 1)] void cs_clear_score(uint3 id : SV_DispatchThreadID) { if (all(id.xy < out_size)) hud_score_u[id.xy] = 0; }
