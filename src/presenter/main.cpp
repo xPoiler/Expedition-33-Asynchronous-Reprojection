@@ -137,6 +137,14 @@ struct MotionVectorScale {
         const double px = scale[0] * render_w, py = scale[1] * render_h;
         const bool pixels = std::fabs(std::fabs(px) - 1) < 0.03 && std::fabs(std::fabs(py) - 1) < 0.03;
         double value[2] = {pixels ? (px > 0 ? 1.0 : -1.0) : scale[0], pixels ? (py > 0 ? 1.0 : -1.0) : scale[1]};
+        // Other common conventions: motion vectors already in uv (scale 1, RE Engine) or in NDC (0.5).
+        if (!pixels)
+            for (const double unit : {1.0, 0.5})
+                if (std::fabs(std::fabs(scale[0]) / unit - 1) < 0.05 && std::fabs(std::fabs(scale[1]) / unit - 1) < 0.05) {
+                    value[0] = scale[0] > 0 ? unit : -unit;
+                    value[1] = scale[1] > 0 ? unit : -unit;
+                    break;
+                }
         const bool same = candidate[0] != 0 && pixels == candidate_pixels &&
                           std::fabs(value[0] / candidate[0] - 1) < 0.05 && std::fabs(value[1] / candidate[1] - 1) < 0.05;
         agree = same ? agree + 1 : 1;
@@ -482,7 +490,8 @@ void render_thread() {
             MotionFit fit;
             if (renderer.take_motion_fit(fit) && mv_scale.add(fit, source.depth_rect.w, source.depth_rect.h))
                 logf("motion vectors locked: %s, scale %.4g x %.4g (sign %+.0f %+.0f), fit quality %.3f",
-                     mv_scale.pixel_units ? "render pixels" : "custom units", mv_scale.scale(0, source.depth_rect.w),
+                     mv_scale.pixel_units ? "render pixels" : std::fabs(std::fabs(mv_scale.locked[0]) - 1) < 1e-9 ? "uv" :
+                     std::fabs(std::fabs(mv_scale.locked[0]) - 0.5) < 1e-9 ? "ndc" : "custom units", mv_scale.scale(0, source.depth_rect.w),
                      mv_scale.scale(1, source.depth_rect.h), mv_scale.locked[0] < 0 ? -1.0 : 1.0, mv_scale.locked[1] < 0 ? -1.0 : 1.0,
                      mv_scale.quality);
             vram.poll(now, notes.empty() ? nullptr : "texture change");

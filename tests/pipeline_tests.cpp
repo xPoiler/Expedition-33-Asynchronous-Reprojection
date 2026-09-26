@@ -431,6 +431,8 @@ int main(int argc, char** argv) {
             renderer.read_back(true, px, w, h);
         };
         auto ingest_frame = [&](int s_slot, bool hud, bool weapon) {
+            EXPECT(s_slot >= 0, "frame published");
+            if (s_slot < 0) return IngestedSource{};
             renderer.set_keep_previous_colour(true);
             renderer.begin_frame();
             IngestedSource s = renderer.ingest(sh, s_slot);
@@ -480,6 +482,17 @@ int main(int argc, char** argv) {
         const double after_x0 = peak(px, w, h, true, 1);
         show(after_src, yaw);
         const double after_x1 = peak(px, w, h, true, 1);
+        // (F) HUD that pops up (RE9 shows it only when needed): masked two game frames after it appears
+        // while the camera turns (8 px per frame here).
+        renderer.reset_hud_detection();
+        for (int i = 0; i < 3; ++i) ingest_frame(publish(420 + i, (i & 1) ? 0.3f : 0.1f, (i & 1) ? 12 : -12, false, false), true, false);
+        IngestedSource popup_src{};
+        for (int i = 0; i < 3; ++i) popup_src = ingest_frame(publish(430 + i, (i & 1) ? 0.3f : 0.1f, (i & 1) ? 12 : -12, false, true), true, false);
+        show(popup_src, 0);
+        const double popup_x0 = green_x();
+        show(popup_src, yaw);
+        const double popup_x1 = green_x();
+        EXPECT(popup_x0 > 0 && std::fabs(popup_x1 - popup_x0) < 2.0, "HUD that just appeared is masked after two frames (%.1f -> %.1f)", popup_x0, popup_x1);
         // (E) Semi-transparent HUD (50% over a scene that changes every frame): detected by its edges.
         renderer.reset_hud_detection();
         hud_patch_colour = 2;
