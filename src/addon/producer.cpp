@@ -42,7 +42,7 @@ Producer::Producer() {
     s.prediction_ms = -16.0f;  // manual value, used when auto is off
     s.present_lead_ms = 6.0f;
     s.no_warp_mask = 1;  // DWM composes ~3 ms after a vblank: finish our frame before it
-    s.auto_prediction = 2;     // default: half a game frame behind (user-preferred: smaller warps, cleaner edges); 1: full, 4: quarter
+    s.auto_prediction = 3;     // default: 1/2 game frame, 1/4 in games without HUD layers (shorter warps hide mask misses); 1: full, 2: half, 4: quarter
     s.manual_gain_x = s.manual_gain_y = 0.0f; s.manual_delay_ms = 0.0f;
 }
 

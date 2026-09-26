@@ -155,11 +155,12 @@ void draw_overlay(effect_runtime*) {
         bool mouse = s.use_mouse != 0;
         if (ImGui::Checkbox("Raw mouse drives rotation", &mouse)) s.use_mouse = mouse;
         ImGui::SliderFloat("Rotation extrapolation", &s.rotation_extrapolation, 0.0f, 1.0f);
-        static const char* const kAutoModes[] = {"Off (manual slider)", "1 game frame", "1/2 game frame", "1/4 game frame"};
-        static const std::uint32_t kAutoValues[] = {0, 1, 2, 4};
+        static const char* const kAutoModes[] = {"Off (manual slider)", "Auto (1/2, or 1/4 without HUD layers)", "1 game frame", "1/2 game frame",
+                                                 "1/4 game frame"};
+        static const std::uint32_t kAutoValues[] = {0, 3, 1, 2, 4};
         int auto_index = 0;
-        for (int i = 0; i < 4; ++i) if (kAutoValues[i] == s.auto_prediction) auto_index = i;
-        if (ImGui::Combo("Auto latency", &auto_index, kAutoModes, 4)) s.auto_prediction = kAutoValues[auto_index];
+        for (int i = 0; i < 5; ++i) if (kAutoValues[i] == s.auto_prediction) auto_index = i;
+        if (ImGui::Combo("Auto latency", &auto_index, kAutoModes, 5)) s.auto_prediction = kAutoValues[auto_index];
         const bool auto_latency = s.auto_prediction != 0;
         if (auto_latency) {
             ImGui::SameLine();

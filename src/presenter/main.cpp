@@ -319,8 +319,10 @@ void render_thread() {
         ps.use_mouse = settings.use_mouse != 0;
         ps.rotation_extrapolation = settings.rotation_extrapolation;
         ps.prediction = settings.prediction_ms / 1000.0;
-        ps.auto_fraction = (settings.auto_prediction == 1 || settings.auto_prediction == 2 || settings.auto_prediction == 4)
-                               ? 1.0 / settings.auto_prediction : 0.0;
+        // Auto: half a game frame, or a quarter when the game sends no HUD layers - the HUD/weapon mask
+        // misses some pixels (semi-transparent HUD), and a shorter warp moves them less.
+        const std::uint32_t fraction = settings.auto_prediction == 3 ? (game_has_hud_layers ? 2u : 4u) : settings.auto_prediction;
+        ps.auto_fraction = (fraction == 1 || fraction == 2 || fraction == 4) ? 1.0 / fraction : 0.0;
         ps.orbit_distance = settings.orbit_distance;
         ps.max_horizon = settings.max_horizon_ms / 1000.0;
         ps.manual_gain = settings.manual_gain != 0;

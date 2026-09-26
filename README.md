@@ -14,7 +14,8 @@ draws the result in a click-through overlay above the game.
 | Game | Notes |
 |---|---|
 | *Clair Obscur: Expedition 33* (Steam) | Add the launch options `-slforcetagging -slviewextension` (see Install). The HUD stays still while the scene is warped. |
-| *Resident Evil Requiem* (Steam) | **Requires [REFramework](https://github.com/praydog/REFramework)**: without it the game's DRM crashes with ReShade. The game doesn't provide separate HUD layers, so the HUD moves with the warp. |
+| *Resident Evil Requiem* (Steam) | **Requires [REFramework](https://github.com/praydog/REFramework)**: without it the game's DRM crashes with ReShade. The game doesn't provide HUD layers, so FrameWarp detects the HUD itself (see *Detect HUD and first-person weapon*). |
+| *Cyberpunk 2077* (Steam) | No launch options needed. The game doesn't provide HUD layers: FrameWarp detects the HUD and V's weapon itself. Semi-transparent HUD panels may still move slightly. |
 
 Other games that use NVIDIA Streamline for DLSS may work but are untested.
 
@@ -66,9 +67,10 @@ Advanced: both files also accept a game name or folder directly (`install.bat "E
 |---|---|
 | **Enable reprojection (N Hz)** | Turns FrameWarp on or off. N is your display's measured refresh rate. |
 | **Show original (A/B)** | Shows the game's own frames, for comparison. |
-| **Auto latency** | How far behind the newest game frame the displayed camera sits: **1/2 frame** (default), **1/4** or **1 frame**. 1 frame is the smoothest; 1/2 and 1/4 have less latency and cleaner screen edges. Turn it **Off** to set the latency by hand. |
+| **Auto latency** | How far behind the newest game frame the displayed camera sits. **Auto** (default) uses 1/2 frame, or 1/4 frame in games without HUD layers, where a shorter warp keeps any undetected HUD steadier. You can also pick **1 frame** (smoothest), **1/2** or **1/4** (less latency, cleaner screen edges), or turn it **Off** to set the latency by hand. |
 | **Present lead (ms)** | How early each frame is rendered before the display refresh (default 6). Raise it if the output drops below your refresh rate. |
-| **Keep HUD still** | Warps the scene but not the HUD. |
+| **Keep HUD still** | Warps the scene but not the HUD, using the HUD layers the game provides (Expedition 33). |
+| **Detect HUD and first-person weapon** | For games without HUD layers (on by default): finds the HUD from what stays put on screen while the camera moves, and a first-person weapon from its motion, and keeps both unwarped. It needs a few seconds of camera movement to learn. |
 | **Presenter GPU priority** | Keep **Realtime**. Lower priorities cannot hold the refresh rate while the game loads the GPU. |
 | **Reset camera model** | Re-learns how the game's camera responds to your mouse. This also happens automatically within seconds of play. |
 | **Start presenter** | Restarts the presenter if it was closed. |
