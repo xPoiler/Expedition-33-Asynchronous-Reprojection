@@ -203,6 +203,7 @@ float4 bilinear(Texture2D<float4> t, float2 pos) {  // pos in texel centres (0.5
 Texture2D<float4> hud_current_t : register(t0);
 Texture2D<float4> hud_previous_t : register(t1);
 Texture2D<float> hud_depth_t : register(t2);
+Texture2D<float4> hud_object_t : register(t3);  // per-pixel analysis: w > 1.5 = attached to the camera
 RWTexture2D<float> hud_score_u : register(u0);
 float luma(Texture2D<float4> t, int2 p) {
     return dot(t.Load(int3(clamp(p, int2(0, 0), int2(out_size) - 1), 0)).rgb, float3(0.299, 0.587, 0.114));
@@ -221,7 +222,12 @@ uint hud_classify(uint2 id, out float weight) {
     const float2 uv = (float2(id) + 0.5) / float2(out_size);
     const int2 pr = int2(rect.xy) + int2(min(uint2(uv * float2(rect.zw)), rect.zw - 1));
     const float depth = hud_depth_t.Load(int3(pr, 0));
-    if ((flags & 16) && depth > 1.0 / 64.0) return 3;
+    // The first-person weapon never enters the HUD map. Exactly the pixels the motion vectors flag as
+    // attached to the camera this frame; before the motion-vector scale is known, everything in the
+    // weapon's depth range (which in some games reaches metres - a crosshair over a near wall would be
+    // missed, so only as a fallback).
+    if (flags & 32) { if (hud_object_t.Load(int3(pr, 0)).w > 1.5) return 3; }
+    else if ((flags & 16) && depth > 1.0 / 64.0) return 3;
     const int2 p = int2(id);
     const float3 delta = abs(hud_current_t.Load(int3(p, 0)).rgb - hud_previous_t.Load(int3(p, 0)).rgb);
     const float change = max(delta.r, max(delta.g, delta.b));
@@ -237,6 +243,14 @@ uint hud_classify(uint2 id, out float weight) {
     const bool telling = moved >= 3.0 && abs(dot(ec, cam_px / max(moved, 1e-6))) >= 0.05;
     if (!same_colour && !same_edge) return change > 0.06 ? (telling ? 2u : 4u) : 0u;
     if (!telling) return 0;
+    // If moving scenery explains the pixel just as well (it matches where the scene came from), it is no
+    // evidence: repeating detail (windows, railings, tiles) can land on an identical copy of itself.
+    const int2 q = clamp(int2(round(float2(p) + cam_px)), int2(0, 0), int2(out_size) - 1);
+    const float3 scenery = abs(hud_current_t.Load(int3(p, 0)).rgb - hud_previous_t.Load(int3(q, 0)).rgb);
+    if (max(scenery.r, max(scenery.g, scenery.b)) < 0.03) return 0;
+    const float2 eq = edge(hud_previous_t, q);
+    const float lq = length(eq);
+    if (lc > 0.05 && lq > 0.05 && dot(ec, eq) > 0.9 * lc * lq && lc < 2.0 * lq && lq < 2.0 * lc) return 0;
     // Stronger evidence for a bigger camera move, but never enough in one frame to reach the mask
     // threshold (0.6): a single repeated or glitched game frame cannot mask scenery.
     weight = min(0.45, 0.1 + 0.6 * saturate(moved / 12.0));
@@ -688,13 +702,14 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         set_x_srv(kXHudSrv + 0, kPBackbuffer);
         set_x_srv(kXHudSrv + 1, kPPrevious);
         set_x_srv(kXHudSrv + 2, kPDepth);
-        for (UINT i = 3; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, kPDepth);
+        set_x_srv(kXHudSrv + 3, kPObject);
+        for (UINT i = 4; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, kPDepth);
         set_x_uav(kXHudUav + 0, kPHudScore);
         D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
         raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
         raw.Buffer.NumElements = 4; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device_->CreateUnorderedAccessView(hud_counts_.Get(), nullptr, &raw, cpu(kXHudUav + 1));
-        c.flags = 2u | (depth_inverted ? 16u : 0u);
+        c.flags = 2u | (depth_inverted ? 16u : 0u) | (attached ? 32u : 0u);
         transition(private_[kPHudScore], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         D3D12_RESOURCE_BARRIER counts{}; counts.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; counts.UAV.pResource = hud_counts_.Get();
         x_dispatch(cs_clear_counts_.Get(), &c, kXHudSrv, kXHudUav, 1, 1);

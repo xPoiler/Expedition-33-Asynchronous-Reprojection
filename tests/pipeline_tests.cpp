@@ -355,7 +355,7 @@ int main(int argc, char** argv) {
         D3D12_DESCRIPTOR_HEAP_DESC mh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         game->CreateDescriptorHeap(&mh, IID_PPV_ARGS(&mv_rtv));
         game->CreateRenderTargetView(motion.Get(), nullptr, mv_rtv->GetCPUDescriptorHandleForHeapStart());
-        const float shift = 8.0f / float(W);  // uv the scene moved since the previous frame (8 output px)
+        const float shift = 6.0f / float(W);  // uv the scene moved since the previous frame (6 output px)
         Camera moving_cam = cam;
         for (int i = 0; i < 16; ++i) moving_cam.clip_to_prev_clip[i] = (i % 5 == 0) ? 1.0f : 0.0f;
         moving_cam.clip_to_prev_clip[12] = 2.0f * shift;  // row-vector: prev.x = x + 2*shift*w (clip), i.e. +shift in uv
@@ -363,6 +363,8 @@ int main(int argc, char** argv) {
         const float green[4] = {0, 1, 0, 1}, teal[4] = {0, 0.7f, 0.6f, 1};
         int hud_patch_colour = 0;
         bool horizontal_bar = false;
+        bool near_wall = false;
+        bool repeating = false;  // scenery that repeats every 6 px (= the camera motion per frame): windows, railings  // a wall close to the camera behind the HUD patch (normal motion vectors)
         int scene_offset = -1;  // textured scene (vertical grey stripes) shifting every frame; >= 0 freezes it
         auto publish = [&](std::uint64_t fid, float bg, LONG bar_dx, bool weapon, bool hud_patch, bool near_strip = true) -> int {
             alloc->Reset();
@@ -405,6 +407,17 @@ int main(int argc, char** argv) {
                 list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), none, 1, &strip);
             }
             producer.on_constants(fid, moving_cam);
+            if (repeating) {  // cyan 3 px stripes, period 6 px, in the lower left: the same image every frame
+                const float cyan[4] = {0, 0.8f, 0.8f, 1};
+                for (LONG x = LONG(W / 16); x < LONG(W / 3); x += 6) {
+                    const D3D12_RECT r{x, LONG(H * 5 / 8), x + 3, LONG(H * 7 / 8)};
+                    list->ClearRenderTargetView(rtv, cyan, 1, &r);
+                }
+            }
+            if (near_wall) {
+                const D3D12_RECT wall{LONG(hx0 * DW / W) - 4, LONG(hy0 * DH / H) - 4, LONG(hx1 * DW / W) + 4, LONG(hy1 * DH / H) + 4};
+                list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0, 1, &wall);
+            }
             if (weapon && near_strip) {  // the weapon is close to the camera: depth 0.5 = 2x the near plane
                 const LONG bx = LONG(DW / 2);
                 const D3D12_RECT strip{bx - 8, 0, bx + 8, LONG(DH)};
@@ -540,6 +553,39 @@ int main(int argc, char** argv) {
         show(repeat_src, yaw);
         const double repeat_x1 = peak(px, w, h, true, 1);
         EXPECT(std::fabs(repeat_x1 - repeat_x0) > 20.0, "repeated frames do not mask the scene (%.0f -> %.0f)", repeat_x0, repeat_x1);
+        // (I) A crosshair over a wall close to the camera (third person aiming at a near wall): HUD, not weapon.
+        renderer.reset_hud_detection();
+        near_wall = true;
+        IngestedSource wall_src{};
+        for (int i = 0; i < 7; ++i) wall_src = ingest_frame(publish(460 + i, (i & 1) ? 0.3f : 0.1f, (i & 1) ? 12 : -12, false, true), true, true);
+        near_wall = false;
+        show(wall_src, 0);
+        const double wall_x0 = green_x();
+        show(wall_src, yaw);
+        const double wall_x1 = green_x();
+        EXPECT(wall_x0 > 0 && std::fabs(wall_x1 - wall_x0) < 2.0, "HUD over a near wall is detected (%.1f -> %.1f)", wall_x0, wall_x1);
+        // (J) Repeating scenery that moves exactly one period per frame looks unchanged, but moving scenery
+        // explains it just as well: it must still warp.
+        renderer.reset_hud_detection();
+        repeating = true;
+        IngestedSource repeat_scene{};
+        for (int i = 0; i < 7; ++i) repeat_scene = ingest_frame(publish(470 + i, (i & 1) ? 0.3f : 0.1f, (i & 1) ? 12 : -12, false, false), true, false);
+        repeating = false;
+        auto cyan_x = [&]() {
+            double sum = 0, weight = 0;
+            for (std::uint32_t y = h * 5 / 8 + 4; y < h * 7 / 8 - 4; ++y)
+                for (std::uint32_t x = 0; x < w / 2; ++x) {
+                    const std::size_t i = (std::size_t(y) * w + x) * 4;
+                    const float c = std::min(half_to_float(px[i + 1]), half_to_float(px[i + 2])) - half_to_float(px[i]);
+                    if (c > 0.5f) { sum += x * c; weight += c; }
+                }
+            return weight > 0 ? sum / weight : -1.0;
+        };
+        show(repeat_scene, 0);
+        const double rep_x0 = cyan_x();
+        show(repeat_scene, yaw);
+        const double rep_x1 = cyan_x();
+        EXPECT(rep_x0 > 0 && rep_x1 < rep_x0 - 20.0, "repeating scenery is not taken for HUD (%.1f -> %.1f)", rep_x0, rep_x1);
         // (E) Semi-transparent HUD (50% over a scene that changes every frame): detected by its edges.
         renderer.reset_hud_detection();
         hud_patch_colour = 2;
