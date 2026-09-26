@@ -60,7 +60,7 @@ if ($GameDir) {
     Write-Host "Scanning Steam libraries..."
     $choices = @()
     foreach ($dir in @(Get-SteamGameDirs | Sort-Object FullName -Unique)) {
-        $found = @(Get-ChildItem -Recurse -Depth 6 -File -ErrorAction SilentlyContinue $dir.FullName -Include ($reshadeNames + "FrameWarp.addon64", "sl.interposer.dll"))
+        $found = @(Get-ChildItem -Recurse -Depth 8 -File -ErrorAction SilentlyContinue $dir.FullName -Include ($reshadeNames + "FrameWarp.addon64", "sl.interposer.dll"))
         $hasReShade = [bool]($found | Where-Object { $reshadeNames -contains $_.Name } | Where-Object { Test-ReShade $_.FullName })
         $hasFrameWarp = [bool]($found | Where-Object { $_.Name -eq "FrameWarp.addon64" })
         $hasStreamline = [bool]($found | Where-Object { $_.Name -eq "sl.interposer.dll" })

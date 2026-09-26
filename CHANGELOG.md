@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0
+
+* **Cyberpunk 2077 support.**
+* **HUD and first-person weapon detection** for games that don't provide HUD layers (Cyberpunk 2077,
+  Resident Evil Requiem). It's on by default and keeps both unwarped:
+  * the weapon and hands are recognised by their motion (they move with the camera);
+  * the HUD is recognised by what stays put on screen while the scene moves under it. That includes
+    HUD that appears only when needed and a crosshair over nearby walls; semi-transparent panels are
+    held by their edges and may still move slightly. Moving or repeating scenery is not mistaken for
+    HUD.
+* **Auto latency** is the new default: 1/2 game frame, or 1/4 in games without HUD layers.
+* Fixed: the view fighting the game's camera when it zooms, for example when stopping aiming while
+  walking backwards in Resident Evil Requiem.
+* Installer: finds the `Engine.ini` of Unreal Engine 4 games too, including ones stored under an extra
+  store folder.
+
 ## 1.1.0
 
 * **Resident Evil Requiem support** (requires REFramework).
