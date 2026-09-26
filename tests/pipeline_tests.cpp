@@ -362,6 +362,7 @@ int main(int argc, char** argv) {
         const LONG hx0 = LONG(W / 8), hx1 = LONG(W / 4), hy0 = LONG(H / 8), hy1 = LONG(H / 4);
         const float green[4] = {0, 1, 0, 1}, teal[4] = {0, 0.7f, 0.6f, 1};
         int hud_patch_colour = 0;
+        bool horizontal_bar = false;
         auto publish = [&](std::uint64_t fid, float bg, LONG bar_dx, bool weapon, bool hud_patch, bool near_strip = true) -> int {
             alloc->Reset();
             list->Reset(alloc.Get(), nullptr);
@@ -371,6 +372,11 @@ int main(int argc, char** argv) {
             list->ClearRenderTargetView(rtv, back, 0, nullptr);
             const D3D12_RECT bar{LONG(W / 2) - 4 + bar_dx, 0, LONG(W / 2) + 4 + bar_dx, LONG(H)};
             list->ClearRenderTargetView(rtv, white, 1, &bar);
+            if (horizontal_bar) {
+                const D3D12_RECT segment{LONG(W / 2 - W / 8), LONG(H * 3 / 4), LONG(W / 2 + W / 8), LONG(H * 3 / 4) + 6};
+                const float yellow[4] = {1, 1, 0, 1};
+                list->ClearRenderTargetView(rtv, yellow, 1, &segment);
+            }
             if (hud_patch) {  // textured like real HUD (text, icons): 2 px stripes
                 // 0: opaque green; 1: teal, shifted 2 px (the content changed); 2: green at 50% over the scene
                 const float blend[4] = {0.5f * bg, 0.5f * bg + 0.5f, 0.5f * bg, 1};
@@ -415,6 +421,16 @@ int main(int argc, char** argv) {
                     const std::size_t i = (std::size_t(y) * w + x) * 4;
                     const float g = half_to_float(px[i + 1]) - half_to_float(px[i]);
                     if (g > 0.3f) { sum += x * g; weight += g; }
+                }
+            return weight > 0 ? sum / weight : -1.0;
+        };
+        auto segment_x = [&]() {  // centroid of the yellow segment (red + green, no blue)
+            double sum = 0, weight = 0;
+            for (std::uint32_t y = h * 3 / 4 - 4; y < h * 3 / 4 + 10; ++y)
+                for (std::uint32_t x = 0; x < w; ++x) {
+                    const std::size_t i = (std::size_t(y) * w + x) * 4;
+                    const float yv = std::min(half_to_float(px[i]), half_to_float(px[i + 1])) - half_to_float(px[i + 2]);
+                    if (yv > 0.5f) { sum += x * yv; weight += yv; }
                 }
             return weight > 0 ? sum / weight : -1.0;
         };
@@ -493,6 +509,18 @@ int main(int argc, char** argv) {
         show(popup_src, yaw);
         const double popup_x1 = green_x();
         EXPECT(popup_x0 > 0 && std::fabs(popup_x1 - popup_x0) < 2.0, "HUD that just appeared is masked after two frames (%.1f -> %.1f)", popup_x0, popup_x1);
+        // (G) Scenery with edges only along the motion (a horizontal bar during a horizontal pan) looks the
+        // same every frame but is not HUD: it must still warp.
+        renderer.reset_hud_detection();
+        horizontal_bar = true;
+        IngestedSource line_src{};
+        for (int i = 0; i < 7; ++i) line_src = ingest_frame(publish(440 + i, 0.1f, (i & 1) ? 12 : -12, false, false), true, false);
+        horizontal_bar = false;
+        show(line_src, 0);
+        const double line_x0 = segment_x();
+        show(line_src, yaw);
+        const double line_x1 = segment_x();
+        EXPECT(line_x0 > 0 && line_x1 < line_x0 - 20.0, "a horizontal edge under a horizontal pan is not taken for HUD (%.1f -> %.1f)", line_x0, line_x1);
         // (E) Semi-transparent HUD (50% over a scene that changes every frame): detected by its edges.
         renderer.reset_hud_detection();
         hud_patch_colour = 2;

@@ -234,10 +234,13 @@ float2 edge(Texture2D<float4> t, int2 p) {  // Sobel luminance gradient
     if (pv.w <= 0) return;
     const float2 cam_px = (float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5) - uv) * float2(out_size);
     if (dot(cam_px, cam_px) < 9.0) return;  // needs >= 3 px of camera motion here to count as evidence
-    if (!same_edge && lc < 0.05) return;     // flat areas (sky, plain walls) look the same either way
-    // Evidence strength grows with how far the camera moved the scene under the pixel: a textured pixel
-    // that stays identical under a large camera move cannot be scenery, so HUD that pops up (RE9) is
-    // masked after about two game frames of turning.
+    // Only detail ALONG the camera motion is evidence: scenery that moved would have changed there. Flat
+    // areas (sky, plain walls) and edges parallel to the motion (a rooftop during a horizontal pan) look
+    // the same whether they moved or not.
+    if (abs(dot(ec, cam_px / length(cam_px))) < 0.05) return;
+    // Evidence strength grows with how far the camera moved the scene under the pixel: a pixel with
+    // detail along the motion that stays identical under a large camera move cannot be scenery, so HUD
+    // that pops up (RE9) is masked after about two game frames of turning.
     hud_score_u[id.xy] = lerp(hud_score_u[id.xy], 1.0, 0.1 + 0.6 * saturate(length(cam_px) / 12.0));
 }
 
