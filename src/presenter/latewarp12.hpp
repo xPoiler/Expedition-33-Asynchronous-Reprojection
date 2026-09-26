@@ -22,7 +22,8 @@ struct LatewarpInputs {
     ID3D12Resource* depth = nullptr;       // R32_FLOAT
     ID3D12Resource* motion = nullptr;      // R16G16_FLOAT (zeros)
     ID3D12Resource* output = nullptr;
-    Rect2 color_rect, depth_rect;
+    ID3D12Resource* no_warp_mask = nullptr;  // optional: pixels (non-zero) that stay where they are (HUD, first-person weapon)
+    Rect2 color_rect, depth_rect, mask_rect;
     bool depth_inverted = true;
 };
 

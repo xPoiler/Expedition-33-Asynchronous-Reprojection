@@ -342,6 +342,111 @@ int main(int argc, char** argv) {
         std::printf("GPU per presented frame: %.3f ms plain, %.3f ms with object extrapolation (+%.3f)\n", plain, with_objects, with_objects - plain);
     }
 
+    // No-warp mask for games without HUD layers. The camera moves (uniform screen motion `shift` in uv);
+    // (A) a strip whose motion vectors ignore that motion (a first-person weapon) and (B) a patch that
+    // stays identical while the scene changes (HUD) must both stay put when the camera turns.
+    {
+        ComPtr<ID3D12Fence> gf; game->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gf));
+        UINT64 fence_value = 0;
+        D3D12_RESOURCE_DESC md = cd; md.Width = DW; md.Height = DH; md.Format = DXGI_FORMAT_R16G16_FLOAT;
+        ComPtr<ID3D12Resource> motion;
+        game->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &md, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&motion));
+        ComPtr<ID3D12DescriptorHeap> mv_rtv;
+        D3D12_DESCRIPTOR_HEAP_DESC mh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        game->CreateDescriptorHeap(&mh, IID_PPV_ARGS(&mv_rtv));
+        game->CreateRenderTargetView(motion.Get(), nullptr, mv_rtv->GetCPUDescriptorHandleForHeapStart());
+        const float shift = 8.0f / float(W);  // uv the scene moved since the previous frame (8 output px)
+        Camera moving_cam = cam;
+        for (int i = 0; i < 16; ++i) moving_cam.clip_to_prev_clip[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+        moving_cam.clip_to_prev_clip[12] = 2.0f * shift;  // row-vector: prev.x = x + 2*shift*w (clip), i.e. +shift in uv
+        const LONG hx0 = LONG(W / 8), hx1 = LONG(W / 4), hy0 = LONG(H / 8), hy1 = LONG(H / 4);
+        const float green[4] = {0, 1, 0, 1};
+        auto publish = [&](std::uint64_t fid, float bg, LONG bar_dx, bool weapon, bool hud_patch) -> int {
+            alloc->Reset();
+            list->Reset(alloc.Get(), nullptr);
+            list->ResourceBarrier(1, &b);  // backbuffer PRESENT -> RENDER_TARGET
+            const float back[4] = {bg, bg, bg, 1};
+            list->ClearRenderTargetView(rtv, back, 0, nullptr);
+            const D3D12_RECT bar{LONG(W / 2) - 4 + bar_dx, 0, LONG(W / 2) + 4 + bar_dx, LONG(H)};
+            list->ClearRenderTargetView(rtv, white, 1, &bar);
+            if (hud_patch) { const D3D12_RECT patch{hx0, hy0, hx1, hy1}; list->ClearRenderTargetView(rtv, green, 1, &patch); }
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            list->ResourceBarrier(1, &b);
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            const float scene_mv[4] = {shift, 0, 0, 0}, none[4] = {0, 0, 0, 0};
+            list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), scene_mv, 0, nullptr);
+            if (weapon) {
+                const LONG bx = LONG(DW / 2);
+                const D3D12_RECT strip{bx - 8, 0, bx + 8, LONG(DH)};
+                list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), none, 1, &strip);
+            }
+            producer.on_constants(fid, moving_cam);
+            producer.on_tag(fid, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
+            producer.on_tag(fid, kMotion, motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, DW, DH, list.Get());
+            const auto t = producer.begin_present(backbuffer.Get(), list.Get());
+            list->Close();
+            queue->ExecuteCommandLists(1, lists);
+            producer.finish_present(queue.Get(), t);
+            queue->Signal(gf.Get(), ++fence_value);
+            while (gf->GetCompletedValue() < fence_value) Sleep(1);
+            int found = -1;
+            for (int i = 0; i < kSlots; ++i) if (sh.slots[i].state == kReady && sh.slots[i].frame_id == fid) found = i;
+            return found;
+        };
+        auto green_x = [&]() {  // centroid of the green patch
+            double sum = 0, weight = 0;
+            for (std::uint32_t y = std::uint32_t(hy0); y < std::uint32_t(hy1); ++y)
+                for (std::uint32_t x = 0; x < w / 2; ++x) {
+                    const std::size_t i = (std::size_t(y) * w + x) * 4;
+                    const float g = half_to_float(px[i + 1]) - half_to_float(px[i]);
+                    if (g > 0.5f) { sum += x * g; weight += g; }
+                }
+            return weight > 0 ? sum / weight : -1.0;
+        };
+        // Present one frame of `s` with the mask, rendered, then turned by `yaw`.
+        auto show = [&](const IngestedSource& s, double turn) {
+            auto* lf = renderer.begin_frame();
+            auto inputs = renderer.latewarp_inputs(s, true);
+            inputs.depth_inverted = true;
+            inputs.no_warp_mask = renderer.no_warp_mask();
+            inputs.mask_rect = s.color_rect;
+            const CameraBasis target = apply_rotation(source, {0, 0, 1}, turn, 0, source.pos);
+            latewarp.evaluate(lf, inputs, turn == 0, view_matrix(target, {}), view_matrix(source, {}), projection);
+            renderer.finish_frame(true, 0);
+            renderer.read_back(true, px, w, h);
+        };
+        auto ingest_frame = [&](int s_slot, bool hud, bool weapon) {
+            renderer.set_keep_previous_colour(true);
+            renderer.begin_frame();
+            IngestedSource s = renderer.ingest(sh, s_slot);
+            renderer.analyze_motion(s, moving_cam.clip_to_prev_clip, 1.0f, 1.0f, true);
+            renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, hud, weapon);
+            renderer.finish_frame(false, 0);
+            renderer.wait_idle();
+            return s;
+        };
+        // (A) first-person weapon from motion vectors.
+        renderer.reset_hud_detection();
+        IngestedSource weapon_src = ingest_frame(publish(200, 0.1f, 0, true, false), false, true);
+        show(weapon_src, 0);
+        const double weapon_x0 = peak(px, w, h, true, 1);
+        show(weapon_src, yaw);
+        const double weapon_x1 = peak(px, w, h, true, 1);
+        // (B) HUD from pixels that stay the same while the scene changes (6 frames).
+        renderer.reset_hud_detection();
+        IngestedSource hud_src{};
+        for (int i = 0; i < 7; ++i) hud_src = ingest_frame(publish(300 + i, (i & 1) ? 0.3f : 0.1f, (i & 1) ? 12 : -12, false, true), true, false);
+        show(hud_src, 0);
+        const double patch_x0 = green_x(), bar_x0 = peak(px, w, h, true, 1);
+        show(hud_src, yaw);
+        const double patch_x1 = green_x(), bar_x1 = peak(px, w, h, true, 1);
+        std::printf("no-warp mask: weapon strip x %.0f -> %.0f; HUD patch x %.1f -> %.1f, scene bar x %.0f -> %.0f (5 deg yaw)\n",
+                    weapon_x0, weapon_x1, patch_x0, patch_x1, bar_x0, bar_x1);
+        EXPECT(std::fabs(weapon_x1 - weapon_x0) < 2.0, "camera-attached strip (motion vectors ignore the camera) is not warped");
+        EXPECT(patch_x0 > 0 && std::fabs(patch_x1 - patch_x0) < 2.0, "static HUD patch is not warped");
+        EXPECT(std::fabs(bar_x1 - bar_x0) > 20.0, "the scene under the HUD mask is still warped");
+    }
+
     // Timing: GPU time of a whole presenter frame (Latewarp + blit), steady state.
     // Every 4th frame takes in a new game frame (ingest + rendered-frame Latewarp), like 30 fps -> 120 Hz.
     double total = 0; int samples = 0;

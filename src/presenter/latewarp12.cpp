@@ -84,7 +84,7 @@ bool Latewarp12::evaluate(ID3D12GraphicsCommandList* list, const LatewarpInputs&
     p->Set("Depth", in.depth);
     p->Set("MotionVectors", in.motion);
     p->Set("Output", in.output);
-    p->Set("Latewarp.NoWarpMask", static_cast<ID3D12Resource*>(nullptr));
+    p->Set("Latewarp.NoWarpMask", in.no_warp_mask);
     auto subrect = [&](const char* key, const Rect2& r) {
         const std::string k = key;
         p->Set((k + ".Subrect.Base.X").c_str(), r.x); p->Set((k + ".Subrect.Base.Y").c_str(), r.y);
@@ -96,6 +96,7 @@ bool Latewarp12::evaluate(ID3D12GraphicsCommandList* list, const LatewarpInputs&
     subrect("Latewarp.Output", in.color_rect);
     subrect("Latewarp.Depth", in.depth_rect);
     subrect("Latewarp.MV", in.depth_rect);
+    if (in.no_warp_mask) subrect("Latewarp.NoWarpMask", in.mask_rect);
     target_ = target_view; source_ = source_view; projection_ = projection;
     p->Set("Latewarp.WorldToViewMatrix", static_cast<void*>(target_.data()));
     p->Set("Latewarp.ViewToClipMatrix", static_cast<void*>(projection_.data()));

@@ -40,7 +40,8 @@ Producer::Producer() {
     s.rotation_extrapolation = 1.0f; s.translation_extrapolation = 1.0f;
     s.orbit_distance = 0.0f; s.max_horizon_ms = 100.0f;
     s.prediction_ms = -16.0f;  // manual value, used when auto is off
-    s.present_lead_ms = 6.0f;  // DWM composes ~3 ms after a vblank: finish our frame before it
+    s.present_lead_ms = 6.0f;
+    s.no_warp_mask = 1;  // DWM composes ~3 ms after a vblank: finish our frame before it
     s.auto_prediction = 2;     // default: half a game frame behind (user-preferred: smaller warps, cleaner edges); 1: full, 4: quarter
     s.manual_gain_x = s.manual_gain_y = 0.0f; s.manual_delay_ms = 0.0f;
 }

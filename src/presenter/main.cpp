@@ -272,6 +272,7 @@ void render_thread() {
     bool device_loss_logged = false;
     MotionVectorScale mv_scale;
     double last_mv_log = 0;
+    bool game_has_hud_layers = false, mask_logged = false;
 
     while (g_app.running) {
         WaitForSingleObjectEx(renderer.waitable(), 100, FALSE);
@@ -372,7 +373,8 @@ void render_thread() {
         auto* list = renderer.begin_frame();
         if (newest >= 0 && InterlockedCompareExchange(&sh.slots[newest].state, kReading, kReady) == kReady) {
             const SlotMeta& m = sh.slots[newest];
-            renderer.set_keep_previous_colour(settings.extrapolate_objects != 0);
+            // The previous frame's colour feeds the HUD detector (and the shelved object interpolation).
+            renderer.set_keep_previous_colour(settings.extrapolate_objects != 0 || (settings.no_warp_mask != 0 && !game_has_hud_layers));
             IngestedSource s = renderer.ingest(sh, newest);
             held.push_back({newest, renderer.submitted_value() + 1});
             if (s.valid) {
@@ -396,9 +398,15 @@ void render_thread() {
                     for (float v : c.clip_to_prev_clip) std::fprintf(g_app.csv_sources, ",%.7g", v);
                     std::fputc('\n', g_app.csv_sources);
                 }
-                if (settings.extrapolate_objects && s.has_motion)
+                game_has_hud_layers = s.has_hudless && s.has_ui && settings.use_ui_tags;
+                const bool mask = settings.no_warp_mask && !game_has_hud_layers && s.has_depth;
+                if ((settings.extrapolate_objects || mask) && s.has_motion)
                     renderer.analyze_motion(s, m.camera.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
                                             float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid);
+                if (mask) {
+                    renderer.build_no_warp_mask(s, m.camera.clip_to_prev_clip, true, s.has_motion && mv_scale.valid);
+                    if (!mask_logged) { logf("no HUD layers from the game: detecting HUD and first-person weapon for the no-warp mask"); mask_logged = true; }
+                }
                 first_eval = true;
                 const double present_t = seconds(m.qpc_present);
                 if (last_source_present > 0) source_interval = present_t - last_source_present;
@@ -419,6 +427,10 @@ void render_thread() {
             std::memcpy(projection.data(), source_camera.view_to_clip, sizeof(projection));
             auto inputs = renderer.latewarp_inputs(source, settings.use_ui_tags != 0);
             inputs.depth_inverted = source_camera.depth_inverted != 0;
+            if (settings.no_warp_mask && !game_has_hud_layers) {
+                inputs.no_warp_mask = renderer.no_warp_mask();
+                inputs.mask_rect = source.color_rect;
+            }
             if (settings.extrapolate_objects && source.has_motion && mv_scale.valid) {
                 const double interval = g_app.model.frame_interval();
                 // Interpolation only: between the object's exact previous and current positions (from the

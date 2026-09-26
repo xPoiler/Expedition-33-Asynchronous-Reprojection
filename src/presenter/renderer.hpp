@@ -83,6 +83,13 @@ public:
     // Keep a copy of the previous game frame's colour at each ingest (background for uncovered areas).
     void set_keep_previous_colour(bool on) { keep_previous_ = on; if (!on) previous_valid_ = false; }
     bool take_motion_fit(MotionFit& fit);
+    // Once per new game frame (after analyze_motion): the no-warp mask for games without HUD layers.
+    // hud: pixels that stay unchanged while the camera moves the scene under them (needs the previous
+    // colour, see set_keep_previous_colour); attached: pixels whose motion vectors ignore the camera
+    // (first-person weapon). Returns the R8 mask at output resolution, kept for the frame's outputs.
+    ID3D12Resource* build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached);
+    ID3D12Resource* no_warp_mask() const { return mask_ready_ ? private_[kPMask].texture.Get() : nullptr; }
+    void reset_hud_detection() { reset_hud_ = true; mask_ready_ = false; }
 
     // Test/diagnostic helper: synchronously reads back the warped output (RGBA16F) or private backbuffer.
     bool read_back(bool output, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h);
@@ -94,7 +101,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPCount };
 
     bool create_pipelines(std::string& error);
     bool ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format);
@@ -126,7 +133,8 @@ private:
     const char* priority_name_ = "normal";
 
     ComPtr<ID3D12RootSignature> root_, root_x_;
-    ComPtr<ID3D12PipelineState> cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_;
+    ComPtr<ID3D12PipelineState> cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_mask_, cs_clear_score_;
+    bool mask_ready_ = false, reset_hud_ = false;
     ComPtr<ID3D12Resource> partials_, sums_, fit_readback_;
     UINT partial_groups_ = 0;
     bool fit_pending_[3] = {};

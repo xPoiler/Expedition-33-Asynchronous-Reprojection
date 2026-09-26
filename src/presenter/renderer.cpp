@@ -59,7 +59,7 @@ float depth_key(float d) { return 1.0 + saturate((log2(max(d, 1e-30)) + 24.0) / 
 
 Texture2D<float> depth_t : register(t0);
 Texture2D<float2> motion_t : register(t1);
-RWTexture2D<float4> object_u : register(u0);        // xy: own motion (render px, to previous frame), z: depth, w: moving
+RWTexture2D<float4> object_u : register(u0);        // xy: own motion (render px, to previous frame), z: depth, w: 1 moving, 2 attached to camera
 RWStructuredBuffer<float4> partial_u : register(u1);
 groupshared float4 gs_a[64], gs_b[64];
 [numthreads(8, 8, 1)] void cs_analyze(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID) {
@@ -77,9 +77,20 @@ groupshared float4 gs_a[64], gs_b[64];
                 const float2 cam_px = cam * float2(rect.zw);
                 const float limit = max(threshold, 0.15 * length(cam_px));  // camera-model error grows with camera speed
                 const bool moving = (flags & 1) && dot(own, own) > limit * limit;
-                o = float4(own, d, moving ? 1 : 0);
-                a = float4(g.x * cam.x, g.x * g.x, cam.x * cam.x, 1);
-                b = float4(g.y * cam.y, g.y * g.y, cam.y * cam.y, moving ? 1 : 0);
+                // Attached to the camera (first-person weapon, hands): the camera turned the world under it,
+                // but its own motion vector is close to zero.
+                const float2 game_px = g * mv_scale * float2(rect.zw);
+                const bool attached = (flags & 1) && length(cam_px) > 1.5 && length(game_px) < 0.25 * length(cam_px);
+                o = float4(own, d, attached ? 2 : (moving ? 1 : 0));
+                // The scale fit only uses pixels whose motion vector points along the camera motion (either
+                // sign per axis); attached or independently moving pixels would bias it.
+                const float lg = length(g), lc = length(cam);
+                const float c1 = abs(dot(g, cam)) / max(lg * lc, 1e-12), c2 = abs(dot(float2(g.x, -g.y), cam)) / max(lg * lc, 1e-12);
+                a.w = 1; b.w = moving ? 1 : 0;  // pixel counts always
+                if (max(c1, c2) > 0.95) {
+                    a.xyz = float3(g.x * cam.x, g.x * g.x, cam.x * cam.x);
+                    b.xyz = float3(g.y * cam.y, g.y * g.y, cam.y * cam.y);
+                }
             }
         }
         object_u[id.xy] = o;
@@ -116,7 +127,7 @@ Texture2D<float4> object_t : register(t0);
 [numthreads(8, 8, 1)] void cs_splat(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= grid)) return;
     const float4 o = object_t.Load(int3(id.xy, 0));
-    if (o.w < 0.5) return;
+    if (o.w < 0.5 || o.w > 1.5) return;
     const float2 move = -o.xy * alpha;
     const int2 dst = int2(floor(float2(id.xy) + move + 0.5));
     if (any(dst < int2(rect.xy)) || any(dst >= int2(rect.xy + rect.zw))) return;
@@ -151,7 +162,7 @@ float4 bilinear(Texture2D<float4> t, float2 pos) {  // pos in texel centres (0.5
     const float4 here = object_g.Load(int3(pr, 0));
     if (key != 0) {
         const int2 off = int2((key >> 11) & 2047, key & 2047) - 1024;
-        const bool occluded = here.w < 0.5 && depth_key(depth_g.Load(int3(pr, 0))) > float(key >> 22) + 2.0;
+        const bool occluded = (here.w < 0.5 || here.w > 1.5) && depth_key(depth_g.Load(int3(pr, 0))) > float(key >> 22) + 2.0;
         if (!occluded) {
             const float4 o = object_g.Load(int3(pr - off, 0));
             const float2 move = -o.xy * alpha;  // exact, in render px
@@ -159,7 +170,7 @@ float4 bilinear(Texture2D<float4> t, float2 pos) {  // pos in texel centres (0.5
             return;
         }
     }
-    if (here.w > 0.5 && alpha != 0) {
+    if (here.w > 0.5 && here.w < 1.5 && alpha != 0) {
         if (flags & 2) {
             const float2 uv = (float2(pr - int2(rect.xy)) + 0.5) / float2(rect.zw);
             const float4 pv = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, depth_g.Load(int3(pr, 0)), 1), clip_to_prev);
@@ -174,10 +185,57 @@ float4 bilinear(Texture2D<float4> t, float2 pos) {  // pos in texel centres (0.5
         const float step = max(1.0, len / 4.0);
         [loop] for (int k = 1; k <= 8; ++k) {
             const int2 q = clamp(pr + int2(round(dir * step * k)), int2(rect.xy), int2(rect.xy + rect.zw) - 1);
-            if (object_g.Load(int3(q, 0)).w < 0.5) { out_u[id.xy] = bilinear(colour_t, centre + dir * step * k * scale); return; }
+            if (abs(object_g.Load(int3(q, 0)).w - 1) > 0.5) { out_u[id.xy] = bilinear(colour_t, centre + dir * step * k * scale); return; }
         }
     }
     out_u[id.xy] = colour_t.Load(int3(id.xy, 0));
+}
+
+// HUD score (output resolution): rises where a pixel stays the same between game frames while the
+// camera moved the scene under it (overlay), falls where it changes. Only frames with camera motion
+// at that pixel update it.
+Texture2D<float4> hud_current_t : register(t0);
+Texture2D<float4> hud_previous_t : register(t1);
+Texture2D<float> hud_depth_t : register(t2);
+RWTexture2D<float> hud_score_u : register(u0);
+[numthreads(8, 8, 1)] void cs_hud(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size) || !(flags & 2)) return;
+    const float2 uv = (float2(id.xy) + 0.5) / float2(out_size);
+    const int2 pr = int2(rect.xy) + int2(min(uint2(uv * float2(rect.zw)), rect.zw - 1));
+    const float4 pv = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, hud_depth_t.Load(int3(pr, 0)), 1), clip_to_prev);
+    if (pv.w <= 0) return;
+    const float2 cam_px = (float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5) - uv) * float2(out_size);
+    if (dot(cam_px, cam_px) < 9.0) return;  // needs >= 3 px of camera motion here to tell
+    const float3 delta = abs(hud_current_t.Load(int3(id.xy, 0)).rgb - hud_previous_t.Load(int3(id.xy, 0)).rgb);
+    const bool same = max(delta.r, max(delta.g, delta.b)) < 0.03;
+    hud_score_u[id.xy] = lerp(hud_score_u[id.xy], same ? 1.0 : 0.0, 0.2);
+}
+
+[numthreads(8, 8, 1)] void cs_clear_score(uint3 id : SV_DispatchThreadID) { if (all(id.xy < out_size)) hud_score_u[id.xy] = 0; }
+
+// No-warp mask (output resolution, R8): HUD (score, widened by 2 px for anti-aliased edges) and
+// camera-attached pixels (widened by 1 render px).
+Texture2D<float> mask_score_t : register(t0);
+Texture2D<float4> mask_object_t : register(t1);
+RWTexture2D<unorm float> mask_u : register(u0);
+[numthreads(8, 8, 1)] void cs_mask(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    bool keep = false;
+    if (flags & 4) {
+        [unroll] for (int y = -2; y <= 2; ++y)
+            [unroll] for (int x = -2; x <= 2; ++x)
+                keep = keep || mask_score_t.Load(int3(clamp(int2(id.xy) + int2(x, y), int2(0, 0), int2(out_size) - 1), 0)) > 0.6;
+    }
+    if (!keep && (flags & 8)) {
+        const float2 uv = (float2(id.xy) + 0.5) / float2(out_size);
+        const int2 pr = int2(rect.xy) + int2(min(uint2(uv * float2(rect.zw)), rect.zw - 1));
+        [unroll] for (int y = -1; y <= 1; ++y)
+            [unroll] for (int x = -1; x <= 1; ++x) {
+                const int2 q = clamp(pr + int2(x, y), int2(rect.xy), int2(rect.xy + rect.zw) - 1);
+                keep = keep || mask_object_t.Load(int3(q, 0)).w > 1.5;
+            }
+    }
+    mask_u[id.xy] = keep ? 1.0 : 0.0;
 }
 )";
 
@@ -189,7 +247,8 @@ constexpr UINT kPrivSrv = 48;       // + private id
 constexpr UINT kXSrvCount = 6;
 constexpr UINT kXAnalyzeSrv = 64, kXAnalyzeUav = 70, kXReduceUav = 72, kXSplatSrv = 74, kXSplatUav = 80;
 constexpr UINT kXGatherSrvHudless = 82, kXGatherSrvBackbuffer = 88, kXGatherUav = 94;
-constexpr UINT kHeapSize = 96;
+constexpr UINT kXHudSrv = 96, kXHudUav = 102, kXMaskSrv = 104, kXMaskUav = 110;
+constexpr UINT kHeapSize = 112;
 
 DXGI_FORMAT srv_format(DXGI_FORMAT f) {
     switch (f) {
@@ -382,7 +441,8 @@ bool Renderer::create_pipelines(std::string& error) {
         error = "extrapolation root signature"; return false;
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } xs[] = {
-        {"cs_analyze", &cs_analyze_}, {"cs_reduce", &cs_reduce_}, {"cs_clear", &cs_clear_}, {"cs_splat", &cs_splat_}, {"cs_gather", &cs_gather_}};
+        {"cs_analyze", &cs_analyze_}, {"cs_reduce", &cs_reduce_}, {"cs_clear", &cs_clear_}, {"cs_splat", &cs_splat_}, {"cs_gather", &cs_gather_},
+        {"cs_hud", &cs_hud_}, {"cs_mask", &cs_mask_}, {"cs_clear_score", &cs_clear_score_}};
     for (auto& x : xs) {
         auto code = compile(x.entry, "cs_5_0", error, kShadersX);
         if (!code) return false;
@@ -538,6 +598,52 @@ ID3D12Resource* Renderer::extrapolate_objects(const IngestedSource& src, bool fr
     x_dispatch(cs_gather_.Get(), &c, gather, kXGatherUav, (ow + 7) / 8, (oh + 7) / 8);
     transition(private_[kPExtrap], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     return private_[kPExtrap].texture.Get();
+}
+
+ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached) {
+    if (!src.has_depth || !private_[kPObject].texture) return nullptr;
+    const UINT ow = private_[kPBackbuffer].width, oh = private_[kPBackbuffer].height;
+    const bool new_score = !private_[kPHudScore].texture || private_[kPHudScore].width != ow || private_[kPHudScore].height != oh;
+    if (!ensure_private(kPHudScore, ow, oh, DXGI_FORMAT_R32_FLOAT) || !ensure_private(kPMask, ow, oh, DXGI_FORMAT_R8_UNORM)) return nullptr;
+    XConstants c{};
+    std::memcpy(c.clip_to_prev, clip_to_prev_clip, sizeof(c.clip_to_prev));
+    const UINT w = private_[kPObject].width, h = private_[kPObject].height;
+    const Rect2 r = src.depth_rect.w ? src.depth_rect : Rect2{0, 0, w, h};
+    c.rect[0] = r.x; c.rect[1] = r.y; c.rect[2] = std::min(r.w, w - r.x); c.rect[3] = std::min(r.h, h - r.y);
+    c.grid[0] = w; c.grid[1] = h;
+    c.out_size[0] = ow; c.out_size[1] = oh;
+    const bool previous = previous_valid_ && !previous_from_hudless_ && private_[kPPrevious].texture &&
+                          private_[kPPrevious].width == ow && private_[kPPrevious].height == oh;
+    if (new_score || reset_hud_) {
+        // New or resized score: start from "not HUD".
+        reset_hud_ = false;
+        transition(private_[kPHudScore], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        set_x_uav(kXHudUav + 0, kPHudScore); set_x_uav(kXHudUav + 1, kPHudScore);
+        XConstants z = c; z.flags = 0;
+        for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, kPBackbuffer);
+        x_dispatch(cs_clear_score_.Get(), &z, kXHudSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
+    }
+    if (hud && previous) {
+        set_x_srv(kXHudSrv + 0, kPBackbuffer);
+        set_x_srv(kXHudSrv + 1, kPPrevious);
+        set_x_srv(kXHudSrv + 2, kPDepth);
+        for (UINT i = 3; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, kPDepth);
+        set_x_uav(kXHudUav + 0, kPHudScore); set_x_uav(kXHudUav + 1, kPHudScore);
+        c.flags = 2;
+        transition(private_[kPHudScore], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        x_dispatch(cs_hud_.Get(), &c, kXHudSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
+    }
+    transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    set_x_srv(kXMaskSrv + 0, kPHudScore);
+    set_x_srv(kXMaskSrv + 1, kPObject);
+    for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXMaskSrv + i, kPObject);
+    set_x_uav(kXMaskUav + 0, kPMask); set_x_uav(kXMaskUav + 1, kPMask);
+    c.flags = (hud ? 4u : 0u) | (attached ? 8u : 0u);
+    transition(private_[kPMask], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    x_dispatch(cs_mask_.Get(), &c, kXMaskSrv, kXMaskUav, (ow + 7) / 8, (oh + 7) / 8);
+    transition(private_[kPMask], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    mask_ready_ = true;
+    return private_[kPMask].texture.Get();
 }
 
 bool Renderer::take_motion_fit(MotionFit& fit) {
