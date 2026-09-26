@@ -80,7 +80,10 @@ groupshared float4 gs_a[64], gs_b[64];
                 // Attached to the camera (first-person weapon, hands): the camera turned the world under it,
                 // but its own motion vector is close to zero.
                 const float2 game_px = g * mv_scale * float2(rect.zw);
-                const bool attached = (flags & 1) && length(cam_px) > 1.5 && length(game_px) < 0.25 * length(cam_px);
+                // Only near the camera (reversed-Z: d = near / distance, so d > 1/64 means closer than 64x the
+                // near plane): the sky and distant scenery often have zero motion vectors too.
+                const bool attached = (flags & 1) && (flags & 16) && d > 1.0 / 64.0 && length(cam_px) > 1.5 &&
+                                      length(game_px) < 0.25 * length(cam_px);
                 o = float4(own, d, attached ? 2 : (moving ? 1 : 0));
                 // The scale fit only uses pixels whose motion vector points along the camera motion (either
                 // sign per axis); attached or independently moving pixels would bias it.
@@ -206,6 +209,15 @@ RWTexture2D<float> hud_score_u : register(u0);
     if (pv.w <= 0) return;
     const float2 cam_px = (float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5) - uv) * float2(out_size);
     if (dot(cam_px, cam_px) < 9.0) return;  // needs >= 3 px of camera motion here to tell
+    // Flat areas (sky, plain walls) look the same whether they moved or not: no evidence either way.
+    float lo = 1e9, hi = -1e9;
+    [unroll] for (int y = -1; y <= 1; ++y)
+        [unroll] for (int x = -1; x <= 1; ++x) {
+            const float3 c = hud_current_t.Load(int3(clamp(int2(id.xy) + int2(x, y), int2(0, 0), int2(out_size) - 1), 0)).rgb;
+            const float l = dot(c, float3(0.299, 0.587, 0.114));
+            lo = min(lo, l); hi = max(hi, l);
+        }
+    if (hi - lo < 0.08) return;
     const float3 delta = abs(hud_current_t.Load(int3(id.xy, 0)).rgb - hud_previous_t.Load(int3(id.xy, 0)).rgb);
     const bool same = max(delta.r, max(delta.g, delta.b)) < 0.03;
     hud_score_u[id.xy] = lerp(hud_score_u[id.xy], same ? 1.0 : 0.0, 0.2);
@@ -213,7 +225,7 @@ RWTexture2D<float> hud_score_u : register(u0);
 
 [numthreads(8, 8, 1)] void cs_clear_score(uint3 id : SV_DispatchThreadID) { if (all(id.xy < out_size)) hud_score_u[id.xy] = 0; }
 
-// No-warp mask (output resolution, R8): HUD (score, widened by 2 px for anti-aliased edges) and
+// No-warp mask (output resolution, R8): HUD (score, widened by 1 px for anti-aliased edges) and
 // camera-attached pixels (widened by 1 render px).
 Texture2D<float> mask_score_t : register(t0);
 Texture2D<float4> mask_object_t : register(t1);
@@ -222,8 +234,8 @@ RWTexture2D<unorm float> mask_u : register(u0);
     if (any(id.xy >= out_size)) return;
     bool keep = false;
     if (flags & 4) {
-        [unroll] for (int y = -2; y <= 2; ++y)
-            [unroll] for (int x = -2; x <= 2; ++x)
+        [unroll] for (int y = -1; y <= 1; ++y)
+            [unroll] for (int x = -1; x <= 1; ++x)
                 keep = keep || mask_score_t.Load(int3(clamp(int2(id.xy) + int2(x, y), int2(0, 0), int2(out_size) - 1), 0)) > 0.6;
     }
     if (!keep && (flags & 8)) {
@@ -504,7 +516,8 @@ struct XConstants {
 static_assert(sizeof(XConstants) == 32 * 4, "root constants");
 }  // namespace
 
-void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid) {
+void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
+                              bool depth_inverted) {
     if (!src.has_depth || !src.has_motion) return;
     const auto& depth = private_[kPDepth];
     const UINT w = depth.width, h = depth.height, gx = (w + 7) / 8, gy = (h + 7) / 8;
@@ -543,7 +556,7 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
     c.mv_scale[0] = scale_x; c.mv_scale[1] = scale_y;
     c.threshold = 1.0f;
     c.groups_x = gx;
-    c.flags = scale_valid ? 1u : 0u;
+    c.flags = (scale_valid ? 1u : 0u) | (depth_inverted ? 16u : 0u);
     transition(private_[kPObject], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     x_dispatch(cs_analyze_.Get(), &c, kXAnalyzeSrv, kXAnalyzeUav, gx, gy);
     D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = partials_.Get();

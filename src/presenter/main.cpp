@@ -402,7 +402,7 @@ void render_thread() {
                 const bool mask = settings.no_warp_mask && !game_has_hud_layers && s.has_depth;
                 if ((settings.extrapolate_objects || mask) && s.has_motion)
                     renderer.analyze_motion(s, m.camera.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
-                                            float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid);
+                                            float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, m.camera.depth_inverted != 0);
                 if (mask) {
                     renderer.build_no_warp_mask(s, m.camera.clip_to_prev_clip, true, s.has_motion && mv_scale.valid);
                     if (!mask_logged) { logf("no HUD layers from the game: detecting HUD and first-person weapon for the no-warp mask"); mask_logged = true; }

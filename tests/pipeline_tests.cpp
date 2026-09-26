@@ -361,15 +361,21 @@ int main(int argc, char** argv) {
         moving_cam.clip_to_prev_clip[12] = 2.0f * shift;  // row-vector: prev.x = x + 2*shift*w (clip), i.e. +shift in uv
         const LONG hx0 = LONG(W / 8), hx1 = LONG(W / 4), hy0 = LONG(H / 8), hy1 = LONG(H / 4);
         const float green[4] = {0, 1, 0, 1};
-        auto publish = [&](std::uint64_t fid, float bg, LONG bar_dx, bool weapon, bool hud_patch) -> int {
+        auto publish = [&](std::uint64_t fid, float bg, LONG bar_dx, bool weapon, bool hud_patch, bool near_strip = true) -> int {
             alloc->Reset();
             list->Reset(alloc.Get(), nullptr);
             list->ResourceBarrier(1, &b);  // backbuffer PRESENT -> RENDER_TARGET
+            list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 0.01f, 0, 0, nullptr);
             const float back[4] = {bg, bg, bg, 1};
             list->ClearRenderTargetView(rtv, back, 0, nullptr);
             const D3D12_RECT bar{LONG(W / 2) - 4 + bar_dx, 0, LONG(W / 2) + 4 + bar_dx, LONG(H)};
             list->ClearRenderTargetView(rtv, white, 1, &bar);
-            if (hud_patch) { const D3D12_RECT patch{hx0, hy0, hx1, hy1}; list->ClearRenderTargetView(rtv, green, 1, &patch); }
+            if (hud_patch) {  // textured like real HUD (text, icons): 2 px green/black stripes
+                for (LONG x = hx0; x < hx1; x += 4) {
+                    const D3D12_RECT stripe{x, hy0, std::min(x + 2, hx1), hy1};
+                    list->ClearRenderTargetView(rtv, green, 1, &stripe);
+                }
+            }
             std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
             list->ResourceBarrier(1, &b);
             std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
@@ -381,6 +387,11 @@ int main(int argc, char** argv) {
                 list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), none, 1, &strip);
             }
             producer.on_constants(fid, moving_cam);
+            if (weapon && near_strip) {  // the weapon is close to the camera: depth 0.5 = 2x the near plane
+                const LONG bx = LONG(DW / 2);
+                const D3D12_RECT strip{bx - 8, 0, bx + 8, LONG(DH)};
+                list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0, 1, &strip);
+            }
             producer.on_tag(fid, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
             producer.on_tag(fid, kMotion, motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, DW, DH, list.Get());
             const auto t = producer.begin_present(backbuffer.Get(), list.Get());
@@ -432,6 +443,14 @@ int main(int argc, char** argv) {
         const double weapon_x0 = peak(px, w, h, true, 1);
         show(weapon_src, yaw);
         const double weapon_x1 = peak(px, w, h, true, 1);
+        // (A2) the same zero-motion strip far away (sky) is not a weapon: it must warp.
+        renderer.reset_hud_detection();
+        IngestedSource sky_src{};
+        sky_src = ingest_frame(publish(251, 0.1f, 0, true, false, false), false, true);
+        show(sky_src, 0);
+        const double sky_x0 = peak(px, w, h, true, 1);
+        show(sky_src, yaw);
+        const double sky_x1 = peak(px, w, h, true, 1);
         // (B) HUD from pixels that stay the same while the scene changes (6 frames).
         renderer.reset_hud_detection();
         IngestedSource hud_src{};
@@ -443,6 +462,7 @@ int main(int argc, char** argv) {
         std::printf("no-warp mask: weapon strip x %.0f -> %.0f; HUD patch x %.1f -> %.1f, scene bar x %.0f -> %.0f (5 deg yaw)\n",
                     weapon_x0, weapon_x1, patch_x0, patch_x1, bar_x0, bar_x1);
         EXPECT(std::fabs(weapon_x1 - weapon_x0) < 2.0, "camera-attached strip (motion vectors ignore the camera) is not warped");
+        EXPECT(std::fabs(sky_x1 - sky_x0) > 20.0, "a far zero-motion strip (sky) is still warped (%.0f -> %.0f)", sky_x0, sky_x1);
         EXPECT(patch_x0 > 0 && std::fabs(patch_x1 - patch_x0) < 2.0, "static HUD patch is not warped");
         EXPECT(std::fabs(bar_x1 - bar_x0) > 20.0, "the scene under the HUD mask is still warped");
     }
