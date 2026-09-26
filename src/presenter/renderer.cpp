@@ -213,35 +213,56 @@ float2 edge(Texture2D<float4> t, int2 p) {  // Sobel luminance gradient
     const float g = luma(t, p + int2(-1, 1)), h = luma(t, p + int2(0, 1)), i = luma(t, p + int2(1, 1));
     return float2((c + 2 * f + i) - (a + 2 * d + g), (g + 2 * h + i) - (a + 2 * b + c)) * 0.25;
 }
-[numthreads(8, 8, 1)] void cs_hud(uint3 id : SV_DispatchThreadID) {
-    if (any(id.xy >= out_size) || !(flags & 2)) return;
-    const float2 uv = (float2(id.xy) + 0.5) / float2(out_size);
+RWByteAddressBuffer hud_counts_u : register(u1);  // [0] evidence pixels, [4] changed pixels (this frame)
+// 0: nothing to learn; 1: evidence for HUD (weight); 2: clearly changed where motion would show it;
+// 3: first-person weapon range; 4: clearly changed elsewhere.
+uint hud_classify(uint2 id, out float weight) {
+    weight = 0;
+    const float2 uv = (float2(id) + 0.5) / float2(out_size);
     const int2 pr = int2(rect.xy) + int2(min(uint2(uv * float2(rect.zw)), rect.zw - 1));
     const float depth = hud_depth_t.Load(int3(pr, 0));
-    if ((flags & 16) && depth > 1.0 / 64.0) { hud_score_u[id.xy] = 0; return; }  // weapon range
-    const int2 p = int2(id.xy);
+    if ((flags & 16) && depth > 1.0 / 64.0) return 3;
+    const int2 p = int2(id);
     const float3 delta = abs(hud_current_t.Load(int3(p, 0)).rgb - hud_previous_t.Load(int3(p, 0)).rgb);
     const float change = max(delta.r, max(delta.g, delta.b));
     const float2 ec = edge(hud_current_t, p), ep = edge(hud_previous_t, p);
     const float lc = length(ec), lp = length(ep);
     const bool same_edge = lc > 0.05 && lp > 0.05 && dot(ec, ep) > 0.9 * lc * lp && lc < 2.0 * lp && lp < 2.0 * lc;
     const bool same_colour = change < 0.03;
-    if (!same_colour && !same_edge) {
-        if (change > 0.06) hud_score_u[id.xy] = hud_score_u[id.xy] * 0.5;
-        return;
-    }
     const float4 pv = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, depth, 1), clip_to_prev);
-    if (pv.w <= 0) return;
-    const float2 cam_px = (float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5) - uv) * float2(out_size);
-    if (dot(cam_px, cam_px) < 9.0) return;  // needs >= 3 px of camera motion here to count as evidence
-    // Only detail ALONG the camera motion is evidence: scenery that moved would have changed there. Flat
-    // areas (sky, plain walls) and edges parallel to the motion (a rooftop during a horizontal pan) look
-    // the same whether they moved or not.
-    if (abs(dot(ec, cam_px / length(cam_px))) < 0.05) return;
-    // Evidence strength grows with how far the camera moved the scene under the pixel: a pixel with
-    // detail along the motion that stays identical under a large camera move cannot be scenery, so HUD
-    // that pops up (RE9) is masked after about two game frames of turning.
-    hud_score_u[id.xy] = lerp(hud_score_u[id.xy], 1.0, 0.1 + 0.6 * saturate(length(cam_px) / 12.0));
+    const float2 cam_px = pv.w > 0 ? (float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5) - uv) * float2(out_size) : float2(0, 0);
+    const float moved = length(cam_px);
+    // Only detail ALONG the camera motion (>= 3 px here) can show whether a pixel moved: flat areas and
+    // edges parallel to the motion (a rooftop during a horizontal pan) look the same either way.
+    const bool telling = moved >= 3.0 && abs(dot(ec, cam_px / max(moved, 1e-6))) >= 0.05;
+    if (!same_colour && !same_edge) return change > 0.06 ? (telling ? 2u : 4u) : 0u;
+    if (!telling) return 0;
+    // Stronger evidence for a bigger camera move, but never enough in one frame to reach the mask
+    // threshold (0.6): a single repeated or glitched game frame cannot mask scenery.
+    weight = min(0.45, 0.1 + 0.6 * saturate(moved / 12.0));
+    return 1;
+}
+[numthreads(1, 1, 1)] void cs_clear_counts(uint3 id : SV_DispatchThreadID) { hud_counts_u.Store2(0, uint2(0, 0)); }
+[numthreads(8, 8, 1)] void cs_hud_count(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size) || !(flags & 2)) return;
+    float weight;
+    const uint kind = hud_classify(id.xy, weight);
+    uint ignored;
+    if (kind == 1) hud_counts_u.InterlockedAdd(0, 1, ignored);
+    else if (kind == 2) hud_counts_u.InterlockedAdd(4, 1, ignored);
+}
+[numthreads(8, 8, 1)] void cs_hud(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size) || !(flags & 2)) return;
+    float weight;
+    const uint kind = hud_classify(id.xy, weight);
+    if (kind == 3) { hud_score_u[id.xy] = 0; return; }
+    if (kind == 2 || kind == 4) { hud_score_u[id.xy] = hud_score_u[id.xy] * 0.5; return; }
+    if (kind != 1) return;
+    // A real HUD covers a small part of the screen. When most telling pixels look unchanged, the frame
+    // itself is suspect (repeated image, hitch, camera data without a new image): learn nothing from it.
+    const uint evidence = hud_counts_u.Load(0), changed = hud_counts_u.Load(4);
+    if (evidence + changed < 256 || evidence > 0.35 * (evidence + changed)) return;
+    hud_score_u[id.xy] = lerp(hud_score_u[id.xy], 1.0, weight);
 }
 
 [numthreads(8, 8, 1)] void cs_clear_score(uint3 id : SV_DispatchThreadID) { if (all(id.xy < out_size)) hud_score_u[id.xy] = 0; }
@@ -475,7 +496,8 @@ bool Renderer::create_pipelines(std::string& error) {
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } xs[] = {
         {"cs_analyze", &cs_analyze_}, {"cs_reduce", &cs_reduce_}, {"cs_clear", &cs_clear_}, {"cs_splat", &cs_splat_}, {"cs_gather", &cs_gather_},
-        {"cs_hud", &cs_hud_}, {"cs_mask", &cs_mask_}, {"cs_clear_score", &cs_clear_score_}};
+        {"cs_hud", &cs_hud_}, {"cs_mask", &cs_mask_}, {"cs_clear_score", &cs_clear_score_},
+        {"cs_hud_count", &cs_hud_count_}, {"cs_clear_counts", &cs_clear_counts_}};
     for (auto& x : xs) {
         auto code = compile(x.entry, "cs_5_0", error, kShadersX);
         if (!code) return false;
@@ -490,6 +512,10 @@ bool Renderer::create_pipelines(std::string& error) {
     bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sums_)))) {
         error = "motion fit buffer"; return false;
+    }
+    bd.Width = 16;
+    if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&hud_counts_)))) {
+        error = "HUD counter buffer"; return false;
     }
     D3D12_HEAP_PROPERTIES rbh{}; rbh.Type = D3D12_HEAP_TYPE_READBACK;
     bd.Width = 3 * 2 * 16; bd.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -663,9 +689,18 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         set_x_srv(kXHudSrv + 1, kPPrevious);
         set_x_srv(kXHudSrv + 2, kPDepth);
         for (UINT i = 3; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, kPDepth);
-        set_x_uav(kXHudUav + 0, kPHudScore); set_x_uav(kXHudUav + 1, kPHudScore);
+        set_x_uav(kXHudUav + 0, kPHudScore);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+        raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
+        raw.Buffer.NumElements = 4; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        device_->CreateUnorderedAccessView(hud_counts_.Get(), nullptr, &raw, cpu(kXHudUav + 1));
         c.flags = 2u | (depth_inverted ? 16u : 0u);
         transition(private_[kPHudScore], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        D3D12_RESOURCE_BARRIER counts{}; counts.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; counts.UAV.pResource = hud_counts_.Get();
+        x_dispatch(cs_clear_counts_.Get(), &c, kXHudSrv, kXHudUav, 1, 1);
+        list_->ResourceBarrier(1, &counts);
+        x_dispatch(cs_hud_count_.Get(), &c, kXHudSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
+        list_->ResourceBarrier(1, &counts);
         x_dispatch(cs_hud_.Get(), &c, kXHudSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
     }
     transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

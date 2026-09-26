@@ -363,6 +363,7 @@ int main(int argc, char** argv) {
         const float green[4] = {0, 1, 0, 1}, teal[4] = {0, 0.7f, 0.6f, 1};
         int hud_patch_colour = 0;
         bool horizontal_bar = false;
+        int scene_offset = -1;  // textured scene (vertical grey stripes) shifting every frame; >= 0 freezes it
         auto publish = [&](std::uint64_t fid, float bg, LONG bar_dx, bool weapon, bool hud_patch, bool near_strip = true) -> int {
             alloc->Reset();
             list->Reset(alloc.Get(), nullptr);
@@ -370,6 +371,13 @@ int main(int argc, char** argv) {
             list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 0.01f, 0, 0, nullptr);
             const float back[4] = {bg, bg, bg, 1};
             list->ClearRenderTargetView(rtv, back, 0, nullptr);
+            // Real scenes are textured: grey stripes that change every frame like scenery under a moving camera.
+            const float grey[4] = {bg + 0.15f, bg + 0.15f, bg + 0.15f, 1};
+            const LONG phase = scene_offset >= 0 ? scene_offset : LONG((fid * 5) % 16);
+            for (LONG x = phase; x < LONG(W); x += 16) {
+                const D3D12_RECT stripe{x, 0, x + 4, LONG(H)};
+                list->ClearRenderTargetView(rtv, grey, 1, &stripe);
+            }
             const D3D12_RECT bar{LONG(W / 2) - 4 + bar_dx, 0, LONG(W / 2) + 4 + bar_dx, LONG(H)};
             list->ClearRenderTargetView(rtv, white, 1, &bar);
             if (horizontal_bar) {
@@ -521,6 +529,17 @@ int main(int argc, char** argv) {
         show(line_src, yaw);
         const double line_x1 = segment_x();
         EXPECT(line_x0 > 0 && line_x1 < line_x0 - 20.0, "a horizontal edge under a horizontal pan is not taken for HUD (%.1f -> %.1f)", line_x0, line_x1);
+        // (H) Repeated game frames (same image, camera data says it moved): nothing may be masked.
+        renderer.reset_hud_detection();
+        scene_offset = 3;
+        IngestedSource repeat_src{};
+        for (int i = 0; i < 4; ++i) repeat_src = ingest_frame(publish(450 + i, 0.1f, 0, false, false), true, false);
+        scene_offset = -1;
+        show(repeat_src, 0);
+        const double repeat_x0 = peak(px, w, h, true, 1);
+        show(repeat_src, yaw);
+        const double repeat_x1 = peak(px, w, h, true, 1);
+        EXPECT(std::fabs(repeat_x1 - repeat_x0) > 20.0, "repeated frames do not mask the scene (%.0f -> %.0f)", repeat_x0, repeat_x1);
         // (E) Semi-transparent HUD (50% over a scene that changes every frame): detected by its edges.
         renderer.reset_hud_detection();
         hud_patch_colour = 2;
@@ -535,7 +554,9 @@ int main(int argc, char** argv) {
                     "after weapon x %.0f -> %.0f; semi-transparent patch x %.1f -> %.1f (5 deg yaw)\n",
                     weapon_x0, weapon_x1, patch_x0, patch_x1, bar_x0, bar_x1, gone_x0, gone_x1, after_x0, after_x1, glass_x0, glass_x1);
         EXPECT(std::fabs(after_x1 - after_x0) > 20.0, "where a held weapon was, the scene warps the next frame (%.0f -> %.0f)", after_x0, after_x1);
-        EXPECT(glass_x0 > 0 && std::fabs(glass_x1 - glass_x0) < 2.0, "semi-transparent HUD is not warped (%.1f -> %.1f)", glass_x0, glass_x1);
+        // Over a textured scene only part of a semi-transparent panel is held (its edges): it must move far
+        // less than the scene (about 32 px here), not necessarily zero.
+        EXPECT(glass_x0 > 0 && std::fabs(glass_x1 - glass_x0) < 8.0, "semi-transparent HUD is mostly held (%.1f -> %.1f)", glass_x0, glass_x1);
         EXPECT(gone_x0 > 0 && gone_x1 < gone_x0 - 20.0, "a former HUD area that changed warps again in the next frame");
         EXPECT(std::fabs(weapon_x1 - weapon_x0) < 2.0, "camera-attached strip (motion vectors ignore the camera) is not warped");
         EXPECT(std::fabs(sky_x1 - sky_x0) > 20.0, "a far zero-motion strip (sky) is still warped (%.0f -> %.0f)", sky_x0, sky_x1);
